@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SQLiteDecisionStore } from "../../src/storage/sqlite-store.ts";
+import { parseDecisionSearchInput } from "../../src/domain/decision-contract.ts";
 
 const tempRoots = new Set();
 after(() => {
@@ -1072,4 +1073,91 @@ test("T406: search hits carry externalId so ledger D numbers identify results", 
   const reverse = dataOf(store.searchDecisions(p.projectId, { refType: "plan", refId: "PLAN-0779" })).decisions;
   assert.equal(reverse.length, 1);
   assert.equal(reverse[0].externalId, "D-1245");
+});
+
+// --- task-424 (D-1257): queryMode additive keyword search -------------------
+// The frozen 377 literal substring stays the byte-identical default; keywords
+// mode splits on whitespace and AND-es per-token literal-substring groups.
+
+test("T424: default literal semantics unchanged — multi-word query is one exact substring", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "alpha beta gamma" }));
+  const hits = (input) => dataOf(store.searchDecisions(p.projectId, input)).decisions;
+  assert.equal(hits({ query: "alpha beta" }).length, 1, "exact phrase matches");
+  assert.equal(hits({ query: "beta alpha" }).length, 0, "literal order matters");
+  assert.equal(hits({ query: "alpha gamma" }).length, 0, "multi-word gap is still 0 hits by default");
+  assert.equal(hits({ query: "alpha beta", queryMode: "literal" }).length, 1, "explicit literal = default");
+});
+
+test("T424: keywords mode AND-matches tokens in any order and across columns", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const a = dataOf(store.createDecision(p.projectId, { decision: "beta gamma", summary: "alpha" }));
+  dataOf(store.createDecision(p.projectId, { decision: "alpha only" }));
+  const hits = (input) => dataOf(store.searchDecisions(p.projectId, input)).decisions;
+  const cross = hits({ query: "gamma alpha", queryMode: "keywords" });
+  assert.deepEqual(cross.map((d) => d.decisionId), [a.decisionId], "one token in summary, one in decision, order-free");
+  assert.equal(hits({ query: "alpha delta", queryMode: "keywords" }).length, 0, "every token must match");
+  assert.deepEqual(hits({ query: "alpha", queryMode: "keywords" }), hits({ query: "alpha" }), "single token ≡ literal");
+  assert.equal(hits({ query: "  alpha   gamma  ", queryMode: "keywords" }).length, 1, "extra whitespace drops empty tokens");
+});
+
+test("T424: keywords tokens stay literal substrings with the frozen LIKE case semantics", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "SQLite and café" }));
+  const hits = (input) => dataOf(store.searchDecisions(p.projectId, input)).decisions;
+  assert.equal(hits({ query: "sql", queryMode: "keywords" }).length, 1, "ASCII case-insensitive substring");
+  assert.equal(hits({ query: "SQLITE", queryMode: "keywords" }).length, 1);
+  assert.equal(hits({ query: "CAFÉ", queryMode: "keywords" }).length, 0, "non-ASCII case sensitivity inherited");
+  dataOf(store.createDecision(p.projectId, { decision: "50%_off deal" }));
+  assert.equal(hits({ query: "50%_off", queryMode: "keywords" }).length, 1, "percent/underscore stay literal");
+  assert.equal(hits({ query: "50_off", queryMode: "keywords" }).length, 0, "no wildcard leakage per token");
+});
+
+test("T424: queryMode validation is fail-closed (four rejections)", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "alpha beta" }));
+  const badEnum = store.searchDecisions(p.projectId, { query: "alpha", queryMode: "fuzzy" });
+  errorOf(badEnum, "VALIDATION_FAILED");
+  assert.equal(badEnum.error.field, "queryMode");
+  const noQuery = store.searchDecisions(p.projectId, { queryMode: "keywords" });
+  errorOf(noQuery, "VALIDATION_FAILED");
+  assert.equal(noQuery.error.field, "queryMode", "mode without query is refused, not ignored");
+  const tooMany = store.searchDecisions(p.projectId, { query: Array.from({ length: 17 }, (_, i) => "w" + i).join(" "), queryMode: "keywords" });
+  errorOf(tooMany, "VALIDATION_FAILED");
+  assert.equal(tooMany.error.field, "query", "17 tokens exceed the 16-token cap");
+  const blank = store.searchDecisions(p.projectId, { query: "   ", queryMode: "keywords" });
+  errorOf(blank, "VALIDATION_FAILED");
+  assert.equal(blank.error.field, "query", "blank query still dies in the frozen parser");
+});
+
+test("T424: the frozen parser still rejects queryMode — the extension lives outside the frozen seam", () => {
+  const direct = parseDecisionSearchInput({ query: "alpha", queryMode: "keywords" });
+  assert.equal(direct.ok, false);
+  assert.equal(direct.error.code, "VALIDATION_FAILED");
+  assert.equal(direct.error.field, "queryMode", "frozen allowlist untouched");
+  const base = parseDecisionSearchInput({ query: "alpha" });
+  assert.equal(base.ok, true, "frozen base input unchanged");
+});
+
+test("T424: keywords composes with reverse refs, timeHorizon and pagination", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const a = dataOf(store.createDecision(p.projectId, { decision: "alpha beta", externalId: "D-1" }));
+  const b = dataOf(store.createDecision(p.projectId, { decision: "alpha gamma", timeHorizon: "temporary" }));
+  const c = dataOf(store.createDecision(p.projectId, { decision: "alpha delta" }));
+  dataOf(store.updateDecision(p.projectId, { decisionId: a.decisionId, expectedRevision: 1, patch: { refs: [{ type: "task", id: "task-424" }] } }));
+  const hits = (input) => dataOf(store.searchDecisions(p.projectId, input)).decisions;
+  const reverse = hits({ query: "alpha beta", queryMode: "keywords", refType: "task", refId: "task-424" });
+  assert.deepEqual(reverse.map((d) => d.decisionId), [a.decisionId], "keywords + reverse refs");
+  const temporary = hits({ query: "alpha", queryMode: "keywords", timeHorizon: "temporary" });
+  assert.deepEqual(temporary.map((d) => d.decisionId), [b.decisionId], "keywords + timeHorizon");
+  const page1 = hits({ query: "alpha", queryMode: "keywords", limit: 2, offset: 0 });
+  const page2 = hits({ query: "alpha", queryMode: "keywords", limit: 2, offset: 2 });
+  assert.equal(page1.length, 2);
+  assert.equal(page2.length, 1, "keywords + pagination");
+  assert.deepEqual([...page1, ...page2].map((d) => d.decisionId).sort(), [a.decisionId, b.decisionId, c.decisionId].sort());
 });

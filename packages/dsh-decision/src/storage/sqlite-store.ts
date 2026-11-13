@@ -480,10 +480,21 @@ interface DecisionSearchParsedInput {
   /** task-393: present together; filter decisions by an outgoing ref edge. */
   refType: DecisionRefType | undefined;
   refId: string | undefined;
+  /** task-424 (D-1257): "literal" is the frozen 377 substring semantics,
+   * byte-identical default; "keywords" splits query on Unicode whitespace and
+   * requires every token to match (AND of per-token literal-substring groups).
+   * Extracted here like timeHorizon/refType/refId — the frozen parser never
+   * sees it. */
+  queryMode: "literal" | "keywords";
+  /** Tokenized query in keywords mode; [] in literal mode. */
+  keywords: string[];
   includeVoided: boolean;
   limit: number;
   offset: number;
 }
+
+/** task-424: bounds the per-token LIKE groups (4 params each, 4N ≤ 64). */
+const MAX_SEARCH_KEYWORDS = 16;
 
 function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInput> {
   if (!isPlainRecord(input)) {
@@ -496,8 +507,16 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   let timeHorizon: TimeHorizon | undefined;
   let refType: DecisionRefType | undefined;
   let refId: string | undefined;
+  let queryMode: "literal" | "keywords" | undefined;
   let hasQuery = false;
   for (const [key, value] of Object.entries(input)) {
+    if (key === "queryMode") {
+      if (value !== "literal" && value !== "keywords") {
+        return validationFailure("queryMode", "Expected 'literal' or 'keywords'.");
+      }
+      queryMode = value;
+      continue;
+    }
     if (key === "timeHorizon") {
       if (value !== "long_term" && value !== "temporary") {
         return validationFailure("timeHorizon", "Expected 'long_term' or 'temporary'.");
@@ -539,11 +558,25 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   if ((refType === undefined) !== (refId === undefined)) {
     return validationFailure(refType === undefined ? "refType" : "refId", "refType and refId must be provided together.");
   }
+  // task-424: the mode only modifies query; the default list has no query
+  // semantics. Fail closed instead of silently ignoring the flag.
+  if (queryMode !== undefined && !hasQuery) {
+    return validationFailure("queryMode", "queryMode requires query; omit it for the default list.");
+  }
   if (hasQuery) {
     // Keyword search keeps the frozen parser's exact validation (including the
-    // rejection of an empty query string); only timeHorizon was extracted.
+    // rejection of an empty query string); only the extensions were extracted.
     const parsed = parseDecisionSearchInput(rest);
     if (!parsed.ok) return parserFailure(parsed);
+    let keywords: string[] = [];
+    if (queryMode === "keywords") {
+      // Unicode whitespace split (JS \s covers the contract's whitespace set);
+      // each token stays a literal substring with the frozen LIKE semantics.
+      keywords = parsed.data.query.split(/\s+/u).filter((token) => token.length > 0);
+      if (keywords.length > MAX_SEARCH_KEYWORDS) {
+        return validationFailure("query", `Too many keywords: at most ${MAX_SEARCH_KEYWORDS} whitespace-separated tokens.`);
+      }
+    }
     return {
       ok: true,
       data: {
@@ -551,6 +584,8 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
         timeHorizon,
         refType,
         refId,
+        queryMode: queryMode ?? "literal",
+        keywords,
         includeVoided: parsed.data.includeVoided,
         limit: parsed.data.limit,
         offset: parsed.data.offset,
@@ -582,7 +617,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
     }
     offset = value;
   }
-  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, includeVoided, limit, offset } };
+  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, queryMode: "literal" as const, keywords: [], includeVoided, limit, offset } };
 }
 
 function timestamp(): string {
@@ -1469,7 +1504,7 @@ export class SQLiteDecisionStore {
     if (!parsed.ok) return parsed;
     this.assertOpen();
 
-    const { query, timeHorizon, refType, refId, includeVoided, limit, offset } = parsed.data;
+    const { query, timeHorizon, refType, refId, queryMode, keywords, includeVoided, limit, offset } = parsed.data;
     const whereParts = ["project_id = ?"];
     const values: BindValue[] = [projectId.data];
     if (!includeVoided) whereParts.push("status = 'effective'");
@@ -1485,12 +1520,25 @@ export class SQLiteDecisionStore {
       values.push(refType, refId);
     }
     if (query !== undefined) {
-      const pattern = escapeLikeLiteral(query);
-      whereParts.push(`(decision_text LIKE ? ESCAPE '\\'
-          OR summary LIKE ? ESCAPE '\\'
-          OR rationale LIKE ? ESCAPE '\\'
-          OR source_reference LIKE ? ESCAPE '\\')`);
-      values.push(pattern, pattern, pattern, pattern);
+      if (queryMode === "keywords") {
+        // task-424: one literal-substring group per token, groups AND-ed.
+        // A single token is exactly the literal branch below.
+        for (const token of keywords) {
+          const pattern = escapeLikeLiteral(token);
+          whereParts.push(`(decision_text LIKE ? ESCAPE '\\'
+              OR summary LIKE ? ESCAPE '\\'
+              OR rationale LIKE ? ESCAPE '\\'
+              OR source_reference LIKE ? ESCAPE '\\')`);
+          values.push(pattern, pattern, pattern, pattern);
+        }
+      } else {
+        const pattern = escapeLikeLiteral(query);
+        whereParts.push(`(decision_text LIKE ? ESCAPE '\\'
+            OR summary LIKE ? ESCAPE '\\'
+            OR rationale LIKE ? ESCAPE '\\'
+            OR source_reference LIKE ? ESCAPE '\\')`);
+        values.push(pattern, pattern, pattern, pattern);
+      }
     }
     const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status, time_horizon AS timeHorizon, external_id AS externalId
       FROM decisions

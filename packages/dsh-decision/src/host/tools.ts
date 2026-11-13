@@ -377,10 +377,11 @@ const DECISION_RECORD: SchemaNode = objectNode({
 
 /** decision_search (contract lines 110-143). */
 const SEARCH_DESCRIPTION =
-"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards.";
+"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring by default: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards. For a multi-word question pass queryMode 'keywords': the query is split on whitespace and every token must match (AND), each token still a literal substring — use it instead of guessing one exact phrase.";
 
 const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
   query: prop(STRING, false, "1–500 code points, not blank; an empty string is rejected. Omit query to list recent decisions in recency order (the default list). Searches summary, decision, rationale and source reference."),
+  queryMode: prop({ type: "string", enum: ["literal", "keywords"] }, false, "How query matches: 'literal' (default) is one exact substring; 'keywords' splits query on whitespace and requires every token to match (AND), each token a literal substring. Requires query; at most 16 tokens."),
   timeHorizon: prop({ type: "string", enum: [...HORIZON] }, false, "Restrict results to long_term or temporary; use it to list the two horizons separately."),
   refType: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, false, "Reverse query: only decisions referencing this type of item. Provide together with refId; bl is not a valid type (direction rule)."),
   refId: prop(STRING, false, "Reverse query: external key of the referenced item (e.g. T-194, D-1119, a commit sha), 1–200 code points. Provide together with refType; answers which decisions reference this key."),

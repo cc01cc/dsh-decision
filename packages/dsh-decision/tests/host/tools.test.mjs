@@ -580,3 +580,31 @@ test("T405: update schema declares add-only refs inside patch, content fields ke
   }
 });
 
+test("T424: search schema declares queryMode and keywords mode works end-to-end", async (t) => {
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  const byName = new Map(createDecisionTools(deps).map((tool) => [tool.name, tool]));
+  const params = byName.get("decision_search").parameters;
+  assert.ok(params.queryMode !== undefined, "queryMode declared");
+  assert.notEqual(params.queryMode.required, true, "queryMode optional (default literal)");
+  assert.deepEqual(params.queryMode.enum, ["literal", "keywords"]);
+  assert.match(byName.get("decision_search").description, /keywords/i);
+
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const search = tools.get("decision_search");
+  await invoke(create, root, { decision: "DSD 注册修法 defineTool 包装", externalId: "D-1238" });
+  const literal = await invoke(search, root, { query: "注册修法 defineTool" });
+  assert.equal(literal.value.ok, true);
+  assert.equal(literal.value.data.decisions.length, 1, "the exact phrase happens to be a substring here");
+  const gap = await invoke(search, root, { query: "DSD defineTool" });
+  assert.equal(gap.value.data.decisions.length, 0, "multi-word gap: literal default unchanged");
+  const keywords = await invoke(search, root, { query: "DSD defineTool", queryMode: "keywords" });
+  assert.equal(keywords.value.ok, true, JSON.stringify(keywords.value));
+  assert.equal(keywords.value.data.decisions.length, 1, "keywords mode closes the multi-word gap");
+  assert.equal(keywords.value.data.decisions[0].externalId, "D-1238", "hit identified by ledger D number");
+  const refused = await invoke(search, root, { queryMode: "keywords" });
+  assert.equal(refused.value.ok, false);
+  assert.equal(refused.value.error.field, "queryMode", "fail-closed at the tool face too");
+});
+
