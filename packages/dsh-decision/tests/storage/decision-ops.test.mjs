@@ -926,7 +926,7 @@ test("the reverse filter requires both coordinates and validates refId", (t) => 
   assert.equal(withQuery.error.field, "refId");
 });
 
-test("refs are immutable after create: update/void keep them, snapshots exclude them", (t) => {
+test("refs are add-only after create (task-405 evolves task-393): update/void keep them, snapshots exclude them", (t) => {
   const store = storeFor(t);
   const p = project(store);
   const created = dataOf(store.createDecision(p.projectId, { decision: "v1", refs: [{ type: "commit", id: "a1b2c3d" }] }));
@@ -938,7 +938,115 @@ test("refs are immutable after create: update/void keep them, snapshots exclude 
   for (const entry of history) {
     assert.ok(!("refs" in entry.snapshot), "snapshots keep the frozen DecisionRecord shape");
   }
-  // The frozen patch face cannot rewrite refs.
+  // No input shape clears edges: an empty refs list is rejected, not applied.
   const patchRefs = store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 3, patch: { refs: [] } });
   errorOf(patchRefs, "VALIDATION_FAILED");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs WHERE decision_id = ?").get(created.decisionId).n, 1);
+});
+
+// --------------------------------------------------- task-405 refs add-only append
+
+test("T405: patch.refs appends edges after create, bumps revision, reports refs in changedFields", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  // XH rules first, dispatches later: the task edge is known only after create.
+  const created = dataOf(store.createDecision(p.projectId, { decision: "rule first", refs: [{ type: "decision", id: "D-1245" }] }));
+  const appended = dataOf(store.updateDecision(p.projectId, {
+    decisionId: created.decisionId, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-405" }] },
+  }));
+  assert.equal(appended.revision, 2, "refs-only append advances the revision");
+  assert.deepEqual(appended.changedFields, ["refs"]);
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId }));
+  assert.deepEqual(got.refs, [{ type: "decision", id: "D-1245" }, { type: "task", id: "T-405" }], "existing edge kept, new edge appended in order");
+  assert.equal(got.decision, "rule first", "content untouched by a refs-only append");
+  const history = dataOf(store.getDecisionHistory(p.projectId, created.decisionId));
+  assert.equal(history.length, 1, "the append creates one snapshot (create itself has none)");
+  assert.equal(history[0].changeKind, "update");
+  assert.equal(history[0].snapshot.decision, "rule first", "snapshot keeps the pre-append content");
+  for (const entry of history) assert.ok(!("refs" in entry.snapshot), "snapshots keep the frozen shape");
+  const reverse = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-405" }));
+  assert.deepEqual(reverse.decisions.map((d) => d.decisionId), [created.decisionId], "reverse index answers the appended edge");
+});
+
+test("T405: duplicate append is a no-op; partial duplicates add only the new edges", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, { decision: "seed", refs: [{ type: "task", id: "T-1" }] }));
+  const dup = dataOf(store.updateDecision(p.projectId, {
+    decisionId: created.decisionId, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-1" }] },
+  }));
+  assert.equal(dup.revision, 1, "an already-present edge changes nothing");
+  assert.deepEqual(dup.changedFields, []);
+  const partial = dataOf(store.updateDecision(p.projectId, {
+    decisionId: created.decisionId, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-1" }, { type: "plan", id: "PLAN-0779" }] },
+  }));
+  assert.equal(partial.revision, 2);
+  assert.deepEqual(partial.changedFields, ["refs"]);
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId }));
+  assert.deepEqual(got.refs, [{ type: "task", id: "T-1" }, { type: "plan", id: "PLAN-0779" }]);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs WHERE decision_id = ?").get(created.decisionId).n, 2, "no duplicate edge row");
+});
+
+test("T405: mixed content+refs patch reports both; unchanged content with new refs still bumps", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, { decision: "same text" }));
+  const mixed = dataOf(store.updateDecision(p.projectId, {
+    decisionId: created.decisionId, expectedRevision: 1,
+    patch: { summary: "short", refs: [{ type: "commit", id: "abc1234" }] },
+  }));
+  assert.equal(mixed.revision, 2);
+  assert.deepEqual(mixed.changedFields, ["summary", "refs"]);
+  const sameContent = dataOf(store.updateDecision(p.projectId, {
+    decisionId: created.decisionId, expectedRevision: 2,
+    patch: { decision: "same text", refs: [{ type: "task", id: "T-9" }] },
+  }));
+  assert.equal(sameContent.revision, 3, "new edges bump even when content is unchanged");
+  assert.deepEqual(sameContent.changedFields, ["refs"], "unchanged content is not reported");
+});
+
+test("T405: append validates like create — direction rule, shapes, atomicity", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, { decision: "base", refs: [{ type: "task", id: "T-1" }] }));
+  const before = store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n;
+  const badLists = [
+    [{ type: "bl", id: "BL-584" }],
+    [{ type: "task", id: "T-1" }, { type: "bl", id: "BL-2" }],
+    null,
+    "T-2",
+    [null],
+    [{ type: "task" }],
+    [{ type: "task", id: "T-2", extra: 1 }],
+    [{ type: "task", id: "T-2" }, { type: "task", id: "T-2" }],
+    [],
+  ];
+  for (const refs of badLists) {
+    const result = store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 1, patch: { refs } });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "refs", JSON.stringify(refs));
+  }
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, before, "no partial edge survives a rejected append");
+  // Envelope discipline on the refs-only path mirrors the frozen parser.
+  const unknownTop = store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-2" }] }, extra: 1 });
+  errorOf(unknownTop, "VALIDATION_FAILED");
+  const badId = store.updateDecision(p.projectId, { decisionId: 0, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-2" }] } });
+  errorOf(badId, "VALIDATION_FAILED");
+  assert.equal(badId.error.field, "decisionId");
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId }));
+  assert.deepEqual(got.refs, [{ type: "task", id: "T-1" }], "original edges untouched by every rejection");
+});
+
+test("T405: append respects the revision, editability and existence gates", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, { decision: "gated" }));
+  const stale = store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 99, patch: { refs: [{ type: "task", id: "T-1" }] } });
+  errorOf(stale, "REVISION_CONFLICT");
+  const missing = store.updateDecision(p.projectId, { decisionId: 999, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-1" }] } });
+  errorOf(missing, "DECISION_NOT_FOUND");
+  dataOf(store.voidDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 1, reason: "done" }));
+  const voided = store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 2, patch: { refs: [{ type: "task", id: "T-1" }] } });
+  errorOf(voided, "DECISION_NOT_EDITABLE");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0, "no gate failure leaves an edge");
 });

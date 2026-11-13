@@ -413,6 +413,58 @@ function buildInsertItem(parsed: DecisionCreateInput, split: CreateExtensionSpli
   if (split.replaces !== undefined) item.replaces = split.replaces;
   return item;
 }
+
+// ---------------------------------------------------------------------------
+// task-405 update extension (D-1245②).
+//
+// refs evolve from create-time immutable to ADD-ONLY: XH rules first and
+// dispatches cards later, so a decision's task/plan edges are often known only
+// after creation. patch.refs APPENDS edges — existing edges are kept, duplicate
+// edges are ignored, and no input shape can remove an edge. Same discipline as
+// create: the field is split out before the frozen parser, which never sees it.
+// ---------------------------------------------------------------------------
+
+function splitUpdateInput(rawInput: unknown): DomainResult<{ base: unknown; refs?: DecisionRef[] }> {
+  if (!isPlainRecord(rawInput)) return { ok: true, data: { base: rawInput } };
+  if (!hasOwnProperty(rawInput, "patch") || !isPlainRecord(rawInput.patch)) {
+    return { ok: true, data: { base: rawInput } };
+  }
+  const patch = rawInput.patch;
+  if (!hasOwnProperty(patch, "refs")) return { ok: true, data: { base: rawInput } };
+  const parsed = parseRefs(patch.refs);
+  if (!parsed.ok) return parsed;
+  // Append needs at least one edge: an empty list is rejected, never applied,
+  // so no input shape can be read as "clear the references" (add-only, D-1245②).
+  if (parsed.data.length === 0) {
+    return validationFailure("refs", "Expected 1–100 refs to append; omit the field instead of passing an empty list.");
+  }
+  const basePatch: Record<string, unknown> = {};
+  for (const [field, value] of Object.entries(patch)) {
+    if (field !== "refs") basePatch[field] = value;
+  }
+  return { ok: true, data: { base: { ...rawInput, patch: basePatch }, refs: parsed.data } };
+}
+
+/**
+ * Envelope validation for a refs-only append.
+ *
+ * The frozen update parser requires at least one CONTENT field, so a patch
+ * carrying only refs cannot go through it. The envelope is validated here with
+ * the same rules and messages (unknown top-level fields rejected; decisionId
+ * and expectedRevision positive safe integers); the content patch stays empty.
+ */
+function parseRefsOnlyUpdateEnvelope(base: Record<string, unknown>): DomainResult<DecisionUpdateInput> {
+  const extra = Object.keys(base).find(
+    (field) => field !== "decisionId" && field !== "expectedRevision" && field !== "patch",
+  );
+  if (extra !== undefined) return validationFailure(extra, "Unknown field.");
+  const decisionId = parsePositiveSafeInteger(base.decisionId, "decisionId");
+  if (!decisionId.ok) return decisionId;
+  const expectedRevision = parsePositiveSafeInteger(base.expectedRevision, "expectedRevision");
+  if (!expectedRevision.ok) return expectedRevision;
+  return { ok: true, data: { decisionId: decisionId.data, expectedRevision: expectedRevision.data, patch: {} } };
+}
+
 // ---------------------------------------------------------------------------
 // task-377 ④ search extensions: the default list and the timeHorizon filter.
 // task-393 ③: the refType/refId reverse filter ("which decisions reference X").
@@ -1507,7 +1559,17 @@ export class SQLiteDecisionStore {
   updateDecision(projectIdInput: unknown, input: unknown): DomainResult<DecisionUpdateReceipt> {
     const projectId = parsePositiveSafeInteger(projectIdInput, "projectId");
     if (!projectId.ok) return projectId;
-    const parsed = parseDecisionUpdateInput(input);
+    const split = splitUpdateInput(input);
+    if (!split.ok) return split;
+    // refs-only append: the frozen parser requires at least one content field,
+    // so a patch carrying only refs is validated as an envelope instead
+    // (task-405); mixed patches go through the frozen parser unchanged.
+    const base = split.data.base;
+    const refsOnly = split.data.refs !== undefined && isPlainRecord(base)
+      && isPlainRecord(base.patch) && Object.keys(base.patch).length === 0;
+    const parsed = refsOnly
+      ? parseRefsOnlyUpdateEnvelope(base as Record<string, unknown>)
+      : parseDecisionUpdateInput(base);
     if (!parsed.ok) return parserFailure(parsed);
     this.assertOpen();
 
@@ -1522,9 +1584,23 @@ export class SQLiteDecisionStore {
           return failure("DECISION_NOT_EDITABLE", "Voided decisions cannot be updated.");
         }
 
-        const changedFields = Object.entries(parsed.data.patch)
+        // task-405 add-only append: INSERT OR IGNORE keeps every existing edge
+        // (uq_decision_refs_edge); the store has no DELETE path on decision_refs,
+        // so no input shape can remove a reference. Edges commit with the update.
+        let refsAdded = 0;
+        if (split.data.refs !== undefined) {
+          const insertRef = prepare(this.database,
+            "INSERT OR IGNORE INTO decision_refs (decision_id, ref_type, ref_key, created_at) VALUES (?, ?, ?, ?)");
+          const edgeCreatedAt = this.nextUpdatedAt(projectId.data);
+          for (const ref of split.data.refs) {
+            refsAdded += Number(insertRef.run(current.decisionId, ref.type, ref.id, edgeCreatedAt).changes);
+          }
+        }
+
+        const contentFields = Object.entries(parsed.data.patch)
           .filter(([field, value]) => current[field as keyof DecisionRow] !== value)
           .map(([field]) => field);
+        const changedFields = refsAdded > 0 ? [...contentFields, "refs"] : contentFields;
         if (changedFields.length === 0) {
           return {
             ok: true,
@@ -1540,25 +1616,38 @@ export class SQLiteDecisionStore {
 
         const updatedAt = this.nextUpdatedAt(projectId.data);
         this.insertSnapshot(current, "update", updatedAt);
-        const columnFor: Record<string, string> = {
-          decision: "decision_text",
-          summary: "summary",
-          rationale: "rationale",
-          timeHorizon: "time_horizon",
-          decisionDate: "decision_date",
-          reviewDate: "review_date",
-          sourceReference: "source_reference",
-        };
-        const setClauses = changedFields.map((field) => `${columnFor[field]} = ?`);
-        const values: (string | number | null)[] = changedFields.map((field) => parsed.data.patch[field as keyof typeof parsed.data.patch] ?? null);
-        values.push(updatedAt, parsed.data.decisionId, projectId.data, parsed.data.expectedRevision);
-        const update = run(this.database,
-          `UPDATE decisions SET ${setClauses.join(", ")}, updated_at = ?, revision = revision + 1
-           WHERE id = ? AND project_id = ? AND revision = ? AND status = 'effective'`,
-          values,
-        );
-        if (update.changes !== 1 && update.changes !== 1n) {
-          throw new Error("Decision update did not affect exactly one row.");
+        if (contentFields.length > 0) {
+          const columnFor: Record<string, string> = {
+            decision: "decision_text",
+            summary: "summary",
+            rationale: "rationale",
+            timeHorizon: "time_horizon",
+            decisionDate: "decision_date",
+            reviewDate: "review_date",
+            sourceReference: "source_reference",
+          };
+          const setClauses = contentFields.map((field) => `${columnFor[field]} = ?`);
+          const values: (string | number | null)[] = contentFields.map((field) => parsed.data.patch[field as keyof typeof parsed.data.patch] ?? null);
+          values.push(updatedAt, parsed.data.decisionId, projectId.data, parsed.data.expectedRevision);
+          const update = run(this.database,
+            `UPDATE decisions SET ${setClauses.join(", ")}, updated_at = ?, revision = revision + 1
+             WHERE id = ? AND project_id = ? AND revision = ? AND status = 'effective'`,
+            values,
+          );
+          if (update.changes !== 1 && update.changes !== 1n) {
+            throw new Error("Decision update did not affect exactly one row.");
+          }
+        } else {
+          // refs-only append still advances the revision and timestamp; the
+          // snapshot above keeps the frozen DecisionRecord shape (no refs key).
+          const update = run(this.database,
+            `UPDATE decisions SET updated_at = ?, revision = revision + 1
+             WHERE id = ? AND project_id = ? AND revision = ? AND status = 'effective'`,
+            [updatedAt, parsed.data.decisionId, projectId.data, parsed.data.expectedRevision],
+          );
+          if (update.changes !== 1 && update.changes !== 1n) {
+            throw new Error("Decision update did not affect exactly one row.");
+          }
         }
         const updated = this.readDecision(projectId.data, parsed.data.decisionId);
         if (updated === undefined) throw new Error("Updated decision could not be reread.");

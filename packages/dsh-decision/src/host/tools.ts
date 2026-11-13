@@ -417,7 +417,7 @@ const CREATE_BATCH_PARAMETERS: Record<string, SchemaNode> = {
 
 /** decision_update (contract lines 258-290). */
 const UPDATE_DESCRIPTION =
-"Edit an existing decision in the current session's project after the user explicitly asks for it. First call decision_get to read the present revision, then pass that value unchanged as expectedRevision. Send only the fields you actually change; omitted fields stay as they are. On REVISION_CONFLICT, re-read and let the user decide — never merge or replay an old patch automatically. Project, number, revision and status cannot be changed.";
+"Edit an existing decision in the current session's project after the user explicitly asks for it. First call decision_get to read the present revision, then pass that value unchanged as expectedRevision. Send only the fields you actually change; omitted fields stay as they are. patch.refs appends references (add-only): existing references stay, duplicates are ignored, and nothing can be removed — use it when a task or plan is dispatched after the decision was recorded. On REVISION_CONFLICT, re-read and let the user decide — never merge or replay an old patch automatically. Project, number, revision and status cannot be changed.";
 
 const UPDATE_PARAMETERS: Record<string, SchemaNode> = {
   decisionId: prop(INTEGER, true, "Positive integer DSD number of the decision to edit."),
@@ -434,10 +434,21 @@ const UPDATE_PARAMETERS: Record<string, SchemaNode> = {
         decisionDate: prop(NULLABLE, false, "New calendar date, or null to clear it."),
         reviewDate: prop(NULLABLE, false, "New calendar date, or null to clear it."),
         sourceReference: prop(NULLABLE, false, "New source text, or null to clear it."),
+        refs: prop(
+          {
+            type: "array",
+            items: objectNode({
+              type: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, true, "What the reference points at. A decision may reference plan, task, commit or decision — never bl (direction rule)."),
+              id: prop(STRING, true, "External key of the referenced item (e.g. T-194, D-1119, a commit sha), 1–200 code points; stored as given, not resolved."),
+            }),
+          },
+          false,
+          "References to APPEND (add-only): existing references are kept, duplicates are ignored, and no reference can ever be removed. Use when a task or plan is dispatched after the decision was recorded. 1–100 entries per call.",
+        ),
       },
     },
     true,
-    "At least one field. Clearing a field requires null; an empty string is rejected.",
+    "At least one field. Clearing a field requires null; an empty string is rejected. refs appends and never clears.",
   ),
 };
 
@@ -500,7 +511,7 @@ const CREATE_BATCH_DATA: SchemaNode = objectNode({
 const UPDATE_DATA: SchemaNode = objectNode({
   decisionId: prop(INTEGER, true, "DSD number."),
   revision: prop(INTEGER, true, "The revision after this update."),
-  changedFields: prop({ type: "array", items: STRING }, true, "Fields this call actually changed."),
+  changedFields: prop({ type: "array", items: STRING }, true, "Fields this call actually changed; includes \"refs\" when new references were appended."),
   status: prop({ type: "string", enum: ["effective"] }, true, "An update keeps the record effective."),
   updatedAt: prop(STRING, true, "New timestamp."),
 });

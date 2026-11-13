@@ -541,3 +541,42 @@ test("T393: schemas expose refs on get and the reverse filter on search", () => 
   assert.match(byName.get("decision_get").description, /refs/i);
 });
 
+// --------------------------------------------------- task-405 refs add-only append
+
+test("T405: decision_update appends refs through the tool face and reports them", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const update = tools.get("decision_update");
+  const get = tools.get("decision_get");
+  const created = await invoke(create, root, { decision: "rule first", refs: [{ type: "decision", id: "D-1245" }] });
+  assert.equal(created.value.ok, true, JSON.stringify(created.value));
+  const id = created.value.data.decisionId;
+  const appended = await invoke(update, root, { decisionId: id, expectedRevision: 1, patch: { refs: [{ type: "task", id: "T-405" }] } });
+  assert.equal(appended.value.ok, true, JSON.stringify(appended.value));
+  assert.deepEqual(appended.value.data.changedFields, ["refs"]);
+  assert.equal(appended.value.data.revision, 2);
+  const got = await invoke(get, root, { decisionId: id });
+  assert.deepEqual(got.value.data.refs, [{ type: "decision", id: "D-1245" }, { type: "task", id: "T-405" }]);
+  // The direction rule holds at the append face too.
+  const reversed = await invoke(update, root, { decisionId: id, expectedRevision: 2, patch: { refs: [{ type: "bl", id: "BL-584" }] } });
+  assert.equal(reversed.value.ok, false);
+  assert.equal(reversed.value.error.code, "VALIDATION_FAILED");
+  assert.equal(reversed.value.error.field, "refs");
+});
+
+test("T405: update schema declares add-only refs inside patch, content fields kept", () => {
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  const byName = new Map(createDecisionTools(deps).map((tool) => [tool.name, tool]));
+  const update = byName.get("decision_update");
+  const patch = update.parameters.patch;
+  assert.ok(patch.properties.refs !== undefined, "patch declares refs");
+  assert.notEqual(patch.properties.refs.required, true, "refs stays optional");
+  assert.deepEqual(patch.properties.refs.items.properties.type.enum, ["decision", "task", "plan", "commit"]);
+  assert.ok(!patch.properties.refs.items.properties.type.enum.includes("bl"), "direction rule visible in the append schema");
+  assert.match(update.description, /add-only/i);
+  for (const field of ["summary", "decision", "rationale", "timeHorizon", "decisionDate", "reviewDate", "sourceReference"]) {
+    assert.ok(patch.properties[field] !== undefined, field + " kept");
+  }
+});
+
