@@ -131,13 +131,14 @@ type BindValue = string | number | bigint | null;
 // stay cached for this connection and DatabaseSync.close() owns connection teardown.
 const statementCache = new WeakMap<DatabaseSync, Map<string, Statement>>();
 
-function failure<T>(code: DomainErrorCode, message: string, field?: string): DomainResult<T> {
+function failure<T>(code: DomainErrorCode, message: string, field?: string, itemIndex?: number): DomainResult<T> {
   return {
     ok: false,
     error: {
       code,
       message,
       ...(field === undefined ? {} : { field }),
+      ...(itemIndex === undefined ? {} : { itemIndex }),
     },
   };
 }
@@ -557,8 +558,9 @@ function escapeLikeLiteral(value: string): string {
   return `%${value.replace(/[\\%_]/gu, "\\$&")}%`;
 }
 
-function previewText(record: DecisionRow): string {
-  const content = record.summary ?? record.decision;
+/** Contract §3 search: preview is the summary when present, else the decision
+ * text, truncated to 240 Unicode code points. */
+function previewText(content: string): string {
   return Array.from(content).slice(0, 240).join("");
 }
 
@@ -764,6 +766,10 @@ export class SQLiteDecisionStore {
       return this.transaction(() => ({ ok: true, data: this.insertDecision(projectId.data, parsed.data) }));
     } catch (error) {
       if (isForeignKeyError(error)) return failure("PROJECT_REQUIRED", "Project is not available in this database.");
+      const constraintField = decisionConstraintField(error);
+      if (constraintField !== undefined) {
+        return validationFailure(constraintField, "Value violates a persisted decision constraint.");
+      }
       return sqliteFailure(error);
     }
   }
@@ -776,13 +782,24 @@ export class SQLiteDecisionStore {
     this.assertOpen();
     try {
       return this.transaction(() => {
+        // All rows were parsed before the transaction opened; a rejected row
+        // therefore comes from a persisted CHECK, not from input validation.
         const decisions = parsed.data.decisions.map((item, index) => {
-          const receipt = this.insertDecision(projectId.data, item);
-          return { index: index + 1, decisionId: receipt.decisionId, revision: 1 as const };
+          try {
+            const receipt = this.insertDecision(projectId.data, item);
+            return { index: index + 1, decisionId: receipt.decisionId, revision: 1 as const };
+          } catch (error) {
+            const constraintField = decisionConstraintField(error);
+            if (constraintField === undefined) throw error;
+            throw new RowConstraintError(index + 1, constraintField);
+          }
         });
         return { ok: true, data: { createdCount: decisions.length, decisions } };
       });
     } catch (error) {
+      if (error instanceof RowConstraintError) {
+        return failure("VALIDATION_FAILED", "Value violates a persisted decision constraint.", error.field, error.itemIndex);
+      }
       if (isForeignKeyError(error)) return failure("PROJECT_REQUIRED", "Project is not available in this database.");
       return sqliteFailure(error);
     }
@@ -838,7 +855,7 @@ export class SQLiteDecisionStore {
         data: {
           decisions: selected.map((row) => ({
             decisionId: row.decisionId,
-            preview: Array.from(row.summary ?? row.decision).slice(0, 240).join(""),
+            preview: previewText(row.summary ?? row.decision),
             status: row.status,
           })),
           hasMore,
@@ -1078,4 +1095,34 @@ export class SQLiteDecisionStore {
 function isForeignKeyError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /FOREIGN KEY constraint failed/i.test(message);
+}
+
+// Frozen contract: errors attributable to one batch row carry a one-based
+// itemIndex and the input field; transaction-level errors never fake them.
+class RowConstraintError extends Error {
+  readonly itemIndex: number;
+  readonly field: string;
+
+  constructor(itemIndex: number, field: string) {
+    super("A batch row violated a persisted decision constraint.");
+    this.itemIndex = itemIndex;
+    this.field = field;
+  }
+}
+
+const DECISION_CONSTRAINT_FIELDS: Record<string, string> = {
+  ck_decisions_text: "decision",
+  ck_decisions_summary: "summary",
+  ck_decisions_rationale_length: "rationale",
+  ck_decisions_source_reference_length: "sourceReference",
+  ck_decisions_decision_date: "decisionDate",
+  ck_decisions_review_date: "reviewDate",
+  ck_decisions_time_horizon: "timeHorizon",
+};
+
+function decisionConstraintField(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = /CHECK constraint failed: (ck_decisions_[a-z_]+)/iu.exec(message);
+  if (match === null) return undefined;
+  return DECISION_CONSTRAINT_FIELDS[match[1]!.toLowerCase()];
 }
