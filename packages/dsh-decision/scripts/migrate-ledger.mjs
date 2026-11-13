@@ -11,7 +11,8 @@
 //   按 D 号去重：全文优先，索引行只贡献日期/状态元数据。
 //
 // 用法（零依赖，Node 24+）：
-//   node scripts/migrate-ledger.mjs --dry-run [--report <path>]
+//   node scripts/migrate-ledger.mjs --dry-run [--strict] [--report <path>]
+//     --strict = 盘点器 T1-e 原口径（###/#### + 表格行）严格子集复算（D-1251）
 //   node scripts/migrate-ledger.mjs --database <abs-path> --recent 20 [--report <path>]
 //   node scripts/migrate-ledger.mjs --database <abs-path> [--report <path>]
 //
@@ -66,10 +67,11 @@ function die(message, code = 2) {
 }
 
 function parseArgs(argv) {
-  const args = { dryRun: false, recent: null, report: null, database: null };
+  const args = { dryRun: false, recent: null, report: null, database: null, strict: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--dry-run") args.dryRun = true;
+    else if (a === "--strict") args.strict = true;
     else if (a === "--recent") args.recent = Number(argv[++i]);
     else if (a === "--report") args.report = argv[++i];
     else if (a === "--database") args.database = argv[++i];
@@ -122,13 +124,17 @@ function extractRefs(text, selfD) {
  * 回写行报告留痕；同号补录/补条/更正并入母条目正文（一字不丢）；
  * 多号标题（## D-802 / D-803 / D-804 / D-805）按号展开共享正文。
  */
-function collectEntries() {
+function collectEntries(strict = false) {
   const raw = [];
   const statusNotes = [];
   let lineLevelT1e = 0;
   let level2Headings = 0;
   let bulletEntries = 0;
   let multiNumberHeadings = 0;
+  // 严格模式 = 盘点器 T1-e 原口径（###/#### 标题 + 表格行），## 与项目符号式
+  // 条目不解析；用于 D-1251 条件「严格子集可复算」。
+  const headingRe = strict ? /^(#{3,4})\s+`?D-(\d+)`?(.*)$/ : RE.heading;
+  const sectionRe = strict ? /^##\s/ : RE.section;
   for (const src of SOURCES) {
     const abs = join(ONE_ROOT, src.rel);
     if (!existsSync(abs)) die("缺输入文件: " + src.rel);
@@ -138,20 +144,24 @@ function collectEntries() {
     const flush = () => { if (current) { raw.push(current); current = null; } };
     lines.forEach((line, i) => {
       const lineNo = i + 1;
-      const h = line.match(RE.heading);
+      const h = line.match(headingRe);
       if (h) {
         const level = h[1].length;
         const dnum = Number(h[2]);
         if (level === 2) level2Headings += 1;
-        if (current && current.dnums.includes(dnum)) {
-          // 同号补录/补条/更正：append-only 更正，属于母条目正文。
+        if (current && current.dnums.length === 1 && current.dnum === dnum) {
+          // 单号母条目的补录/补条/更正：append-only，属于母条目正文。
+          // 多号批次不在此吸收成员详情标题（否则详情扩散到全体成员）。
           current.bodyLines.push(line);
           current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
           return;
         }
         flush();
-        const rawIds = [...line.matchAll(/\bD-(\d+)\b/g)].map((m) => m[0]);
-        const uniqueRaw = [...new Set(rawIds.length ? rawIds : ["D-" + h[2]])];
+        // 多号展开只认标题起首的并列枚举（D-802 / D-803 / …）；
+        // 标题里被修订/引用/撤销的 D 号不是并列条目（防跨条正文污染）。
+        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[\/、,，]\s*`?D-\d+)*)/);
+        const rawIds = enumMatch ? [...enumMatch[1].matchAll(/D-(\d+)/g)].map((m) => m[0]) : ["D-" + h[2]];
+        const uniqueRaw = [...new Set(rawIds)];
         const uniqueDnums = uniqueRaw.map((s) => Number(s.slice(2)));
         if (uniqueDnums.length > 1) multiNumberHeadings += 1;
         current = {
@@ -163,7 +173,7 @@ function collectEntries() {
         };
         return;
       }
-      const b = line.match(RE.bullet);
+      const b = strict ? null : line.match(RE.bullet);
       if (b) {
         flush();
         bulletEntries += 1;
@@ -177,7 +187,7 @@ function collectEntries() {
         return;
       }
       if (current) {
-        const boundary = RE.nextEntry.test(line) || RE.section.test(line)
+        const boundary = RE.nextEntry.test(line) || sectionRe.test(line)
           || (current.kind === "bullet" && /^-\s/.test(line));
         if (boundary) { flush(); }
         else { current.bodyLines.push(line); return; }
@@ -332,7 +342,7 @@ function scanReplaces(built, byDnum, statusNotes) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const { raw, lineLevelT1e, level2Headings, bulletEntries, multiNumberHeadings, statusNotes, entries, indexMeta, mergedSupplements } = collectEntries();
+  const { raw, lineLevelT1e, level2Headings, bulletEntries, multiNumberHeadings, statusNotes, entries, indexMeta, mergedSupplements } = collectEntries(args.strict);
   if (lineLevelT1e === 0) die("空扫描：两源文件零候选（空扫不是通过）");
 
   const built = entries.map((e) => ({ entry: e, ...buildDecision(e, indexMeta) }));
@@ -349,7 +359,7 @@ function main() {
   if (args.recent !== null) selected = [...ok].sort((a, b) => Number(b.externalId.slice(2)) - Number(a.externalId.slice(2))).slice(0, args.recent).sort((a, b) => Number(a.externalId.slice(2)) - Number(b.externalId.slice(2)));
 
   const report = {
-    task: "task-406", mode: args.dryRun ? "dry-run" : args.recent !== null ? "recent-" + args.recent : "full",
+    task: "task-406", mode: (args.dryRun ? "dry-run" : args.recent !== null ? "recent-" + args.recent : "full") + (args.strict ? "-strict" : ""),
     generatedAt: new Date().toISOString(),
     caliber: {
       lineLevelT1e,
@@ -364,6 +374,7 @@ function main() {
       parsedOk: ok.length,
       parseFailed: failed.map((f) => ({ externalId: f.externalId, file: f.entry.file, line: f.entry.line, reasons: f.reasons })),
       selectedForMigration: selected.length,
+      externalIds: ok.map((b) => b.externalId),
     },
     refs: {
       byType: { plan: 0, task: 0, commit: 0, decision: 0 },

@@ -472,6 +472,7 @@ const SEARCH_DATA: SchemaNode = objectNode({
         preview: prop(STRING, true, "Up to 240 code points."),
         status: prop({ type: "string", enum: [...STATUS] }, true, "effective or voided."),
         timeHorizon: prop({ type: "string", enum: [...HORIZON] }, true, "long_term or temporary."),
+        externalId: prop(NULLABLE, true, "External id (e.g. ledger D number) when set, else null; identifies hits without a follow-up get."),
       }),
     },
     true,

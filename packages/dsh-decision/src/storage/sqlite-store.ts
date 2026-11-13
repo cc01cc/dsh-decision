@@ -80,6 +80,9 @@ export interface DecisionSearchItem {
   status: DecisionStatus;
   /** task-377 ④: lets callers separate temporary from long-term decisions. */
   timeHorizon: TimeHorizon;
+  /** task-406 自用验证：命中项直接带外部键（台账 D 号），无需逐条 get 回查；
+   * 未设 externalId 的决策为 null。只增字段，不改既有字段语义。 */
+  externalId: string | null;
 }
 
 export interface DecisionSearchPage {
@@ -1489,7 +1492,7 @@ export class SQLiteDecisionStore {
           OR source_reference LIKE ? ESCAPE '\\')`);
       values.push(pattern, pattern, pattern, pattern);
     }
-    const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status, time_horizon AS timeHorizon
+    const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status, time_horizon AS timeHorizon, external_id AS externalId
       FROM decisions
       WHERE ${whereParts.join(" AND ")}
       ORDER BY updated_at DESC, id DESC
@@ -1497,7 +1500,7 @@ export class SQLiteDecisionStore {
     values.push(limit + 1, offset);
 
     try {
-      const rows = many<{ decisionId: number; summary: string | null; decision: string; status: DecisionStatus; timeHorizon: TimeHorizon }>(
+      const rows = many<{ decisionId: number; summary: string | null; decision: string; status: DecisionStatus; timeHorizon: TimeHorizon; externalId: string | null }>(
         this.database,
         sql,
         values,
@@ -1512,6 +1515,7 @@ export class SQLiteDecisionStore {
             preview: previewText(row.summary ?? row.decision),
             status: row.status,
             timeHorizon: row.timeHorizon,
+            externalId: row.externalId,
           })),
           hasMore,
         },

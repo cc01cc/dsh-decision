@@ -1050,3 +1050,26 @@ test("T405: append respects the revision, editability and existence gates", (t) 
   errorOf(voided, "DECISION_NOT_EDITABLE");
   assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0, "no gate failure leaves an edge");
 });
+
+test("T406: search hits carry externalId so ledger D numbers identify results", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const withExt = dataOf(store.createDecision(p.projectId, { decision: "台账迁移查询面", externalId: "D-1245" }));
+  const withoutExt = dataOf(store.createDecision(p.projectId, { decision: "台账迁移无外部键" }));
+  const hits = dataOf(store.searchDecisions(p.projectId, { query: "台账迁移" })).decisions;
+  assert.equal(hits.length, 2);
+  const byId = new Map(hits.map((h) => [h.decisionId, h]));
+  assert.equal(byId.get(withExt.decisionId).externalId, "D-1245", "外部键随命中项返回，无需逐条 get");
+  assert.equal(byId.get(withoutExt.decisionId).externalId, null, "未设外部键为 null");
+  // 既有字段语义不变（只增不改）。
+  for (const h of hits) {
+    assert.equal(typeof h.preview, "string");
+    assert.equal(h.status, "effective");
+    assert.equal(h.timeHorizon, "long_term");
+  }
+  // 反向 refs 查询的命中项同样带外部键。
+  dataOf(store.updateDecision(p.projectId, { decisionId: withExt.decisionId, expectedRevision: 1, patch: { refs: [{ type: "plan", id: "PLAN-0779" }] } }));
+  const reverse = dataOf(store.searchDecisions(p.projectId, { refType: "plan", refId: "PLAN-0779" })).decisions;
+  assert.equal(reverse.length, 1);
+  assert.equal(reverse[0].externalId, "D-1245");
+});
