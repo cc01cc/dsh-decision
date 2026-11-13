@@ -24,7 +24,7 @@
     "lib/typert.client.js"
   ],
   "scripts": {
-    "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/host/config.test.mjs"
+    "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/host/config.test.mjs tests/host/caller.test.mjs tests/host/binding.test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/schemastery": "~3.19.0"
