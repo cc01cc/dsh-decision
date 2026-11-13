@@ -813,3 +813,132 @@ test("update and void never touch externalId/replaces; snapshots keep the frozen
   const patchKey = store.updateDecision(p.projectId, { decisionId: old.decisionId, expectedRevision: 1, patch: { externalId: "D-999" } });
   errorOf(patchKey, "VALIDATION_FAILED");
 });
+
+// ---------------------------------------------------------------------------
+// task-393 ③: the refs-of query surface. decision_get carries the decision's
+// own edges ("does this decision have a downstream task", requirements §11
+// item 3); decision_search's refType/refId filter is the reverse direction
+// ("which decisions reference this key"), served by idx_decision_refs_reverse.
+// ---------------------------------------------------------------------------
+
+test("getDecision returns the decision's refs and answers exists/not-exists by type", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const withRefs = dataOf(store.createDecision(p.projectId, {
+    decision: "has downstream",
+    refs: [{ type: "task", id: "T-194" }, { type: "decision", id: "D-1119" }],
+  }));
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: withRefs.decisionId }));
+  assert.deepEqual(got.refs, [{ type: "task", id: "T-194" }, { type: "decision", id: "D-1119" }]);
+  assert.equal(got.refs.some((ref) => ref.type === "task"), true, "this decision HAS a downstream task");
+
+  const bare = dataOf(store.createDecision(p.projectId, { decision: "no downstream" }));
+  const bareGot = dataOf(store.getDecision(p.projectId, { decisionId: bare.decisionId }));
+  assert.deepEqual(bareGot.refs, [], "no refs reads as an empty list, not null");
+  assert.equal(bareGot.refs.some((ref) => ref.type === "task"), false, "this decision has NO downstream task");
+});
+
+test("search refType/refId is the reverse query: hit, empty, and combined filters", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const a = dataOf(store.createDecision(p.projectId, { decision: "alpha task work", refs: [{ type: "task", id: "T-194" }] }));
+  const b = dataOf(store.createDecision(p.projectId, { decision: "beta task work", timeHorizon: "temporary", refs: [{ type: "task", id: "T-194" }, { type: "plan", id: "PLAN-0769" }] }));
+  dataOf(store.createDecision(p.projectId, { decision: "gamma other task", refs: [{ type: "task", id: "T-999" }] }));
+  const d = dataOf(store.createDecision(p.projectId, { decision: "delta voided", refs: [{ type: "task", id: "T-194" }] }));
+  dataOf(store.voidDecision(p.projectId, { decisionId: d.decisionId, expectedRevision: 1, reason: "done" }));
+
+  // Hit: exactly the decisions carrying the (task, T-194) edge, recency order.
+  const hits = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-194" }));
+  assert.deepEqual(hits.decisions.map((x) => x.decisionId), [b.decisionId, a.decisionId]);
+  assert.equal(hits.hasMore, false);
+
+  // Empty: a key nothing references answers an empty page, not an error.
+  const empty = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-000" }));
+  assert.deepEqual(empty.decisions, []);
+  assert.equal(empty.hasMore, false);
+  // Direction consistency: no decision can reference bl, so a bl-style key
+  // under any valid type is empty too (the edge cannot exist).
+  const blKey = dataOf(store.searchDecisions(p.projectId, { refType: "decision", refId: "BL-584" }));
+  assert.deepEqual(blKey.decisions, []);
+
+  // The type coordinate matters: same key under plan matches only b.
+  const planHits = dataOf(store.searchDecisions(p.projectId, { refType: "plan", refId: "PLAN-0769" }));
+  assert.deepEqual(planHits.decisions.map((x) => x.decisionId), [b.decisionId]);
+
+  // Combines with keyword, horizon, and voided inclusion.
+  const kw = dataOf(store.searchDecisions(p.projectId, { query: "alpha", refType: "task", refId: "T-194" }));
+  assert.deepEqual(kw.decisions.map((x) => x.decisionId), [a.decisionId]);
+  const temp = dataOf(store.searchDecisions(p.projectId, { timeHorizon: "temporary", refType: "task", refId: "T-194" }));
+  assert.deepEqual(temp.decisions.map((x) => x.decisionId), [b.decisionId]);
+  const withVoided = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-194", includeVoided: true }));
+  assert.deepEqual(withVoided.decisions.map((x) => x.decisionId), [d.decisionId, b.decisionId, a.decisionId]);
+
+  // Paging works on the reverse query like on every other search.
+  const page1 = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-194", limit: 1 }));
+  assert.deepEqual(page1.decisions.map((x) => x.decisionId), [b.decisionId]);
+  assert.equal(page1.hasMore, true);
+  const page2 = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-194", limit: 1, offset: 1 }));
+  assert.deepEqual(page2.decisions.map((x) => x.decisionId), [a.decisionId]);
+  assert.equal(page2.hasMore, false);
+
+  // The reverse query is project-scoped like every other search.
+  const other = project(store, "Borealis", "borealis");
+  dataOf(store.createDecision(other.projectId, { decision: "foreign", refs: [{ type: "task", id: "T-194" }] }));
+  const scoped = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-194" }));
+  assert.equal(scoped.decisions.length, 2, "another project's edge does not leak in");
+});
+
+test("the reverse filter keeps the direction rule: bl is not a filter type", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "seed", refs: [{ type: "task", id: "T-1" }] }));
+  const reversed = store.searchDecisions(p.projectId, { refType: "bl", refId: "BL-584" });
+  errorOf(reversed, "VALIDATION_FAILED");
+  assert.equal(reversed.error.field, "refType");
+  assert.match(reversed.error.message, /direction rule/i);
+  for (const badType of ["issue", "", null, 42, {}]) {
+    const result = store.searchDecisions(p.projectId, { refType: badType, refId: "T-1" });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "refType", JSON.stringify(badType));
+  }
+});
+
+test("the reverse filter requires both coordinates and validates refId", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const halfType = store.searchDecisions(p.projectId, { refType: "task" });
+  errorOf(halfType, "VALIDATION_FAILED");
+  assert.equal(halfType.error.field, "refId");
+  const halfId = store.searchDecisions(p.projectId, { refId: "T-194" });
+  errorOf(halfId, "VALIDATION_FAILED");
+  assert.equal(halfId.error.field, "refType");
+  // Explicit undefined is omission, not a half filter.
+  const omitted = dataOf(store.searchDecisions(p.projectId, { refType: undefined, refId: undefined }));
+  assert.equal(omitted.decisions.length, 0);
+  for (const badId of ["", "   ", "a\u0000b", "x".repeat(201), 194, null, {}]) {
+    const result = store.searchDecisions(p.projectId, { refType: "task", refId: badId });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "refId", JSON.stringify(badId));
+  }
+  // The reverse filter also works on the keyword path's validation surface.
+  const withQuery = store.searchDecisions(p.projectId, { query: "seed", refType: "task" });
+  errorOf(withQuery, "VALIDATION_FAILED");
+  assert.equal(withQuery.error.field, "refId");
+});
+
+test("refs are immutable after create: update/void keep them, snapshots exclude them", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, { decision: "v1", refs: [{ type: "commit", id: "a1b2c3d" }] }));
+  dataOf(store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 1, patch: { decision: "v2" } }));
+  dataOf(store.voidDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 2, reason: "done" }));
+  const current = dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId }));
+  assert.deepEqual(current.refs, [{ type: "commit", id: "a1b2c3d" }]);
+  const history = dataOf(store.getDecisionHistory(p.projectId, created.decisionId));
+  for (const entry of history) {
+    assert.ok(!("refs" in entry.snapshot), "snapshots keep the frozen DecisionRecord shape");
+  }
+  // The frozen patch face cannot rewrite refs.
+  const patchRefs = store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 3, patch: { refs: [] } });
+  errorOf(patchRefs, "VALIDATION_FAILED");
+});

@@ -68,6 +68,10 @@ export interface DecisionRef {
 export interface DecisionRecordView extends DecisionRecord {
   externalId: string | null;
   replaces: number[] | null;
+  /** task-393: the decision's typed references in insertion order, [] when
+   * none. Reading them answers "does this decision have a downstream task"
+   * (requirements §11 item 3) without a seventh tool. */
+  refs: DecisionRef[];
 }
 
 export interface DecisionSearchItem {
@@ -411,12 +415,16 @@ function buildInsertItem(parsed: DecisionCreateInput, split: CreateExtensionSpli
 }
 // ---------------------------------------------------------------------------
 // task-377 ④ search extensions: the default list and the timeHorizon filter.
+// task-393 ③: the refType/refId reverse filter ("which decisions reference X").
 
 interface DecisionSearchParsedInput {
   /** undefined means the caller omitted query: list recent decisions (the
    * default list, requirements §10.5) instead of a keyword search. */
   query: string | undefined;
   timeHorizon: TimeHorizon | undefined;
+  /** task-393: present together; filter decisions by an outgoing ref edge. */
+  refType: DecisionRefType | undefined;
+  refId: string | undefined;
   includeVoided: boolean;
   limit: number;
   offset: number;
@@ -431,6 +439,8 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   }
   const rest: Record<string, unknown> = {};
   let timeHorizon: TimeHorizon | undefined;
+  let refType: DecisionRefType | undefined;
+  let refId: string | undefined;
   let hasQuery = false;
   for (const [key, value] of Object.entries(input)) {
     if (key === "timeHorizon") {
@@ -440,12 +450,39 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
       timeHorizon = value;
       continue;
     }
+    if (key === "refType") {
+      if (value !== undefined) {
+        if (typeof value !== "string" || !(DECISION_REF_TYPES as readonly string[]).includes(value)) {
+          // Same direction rule as the write face: bl is not a ref type a
+          // decision may carry, so it is not a filter value either.
+          return validationFailure("refType", "Expected ref type decision, task, plan or commit; a decision must not reference bl (direction rule).");
+        }
+        refType = value as DecisionRefType;
+      }
+      continue;
+    }
+    if (key === "refId") {
+      if (value !== undefined) {
+        if (typeof value !== "string") return validationFailure("refId", "Expected a string of 1–200 code points.");
+        if (value.includes("\u0000")) return validationFailure("refId", "NUL is not allowed.");
+        const idLength = Array.from(value).length;
+        if (idLength < 1 || idLength > 200) return validationFailure("refId", "Expected 1–200 Unicode code points.");
+        if (isBlankContract(value)) return validationFailure("refId", "Must not be blank.");
+        refId = value;
+      }
+      continue;
+    }
     if (key === "query") {
       hasQuery = value !== undefined;
       if (hasQuery) rest.query = value;
       continue;
     }
     rest[key] = value;
+  }
+  // The reverse filter addresses the (ref_type, ref_key) index: both coordinates
+  // are required, and a half filter is a caller error, not a silent full scan.
+  if ((refType === undefined) !== (refId === undefined)) {
+    return validationFailure(refType === undefined ? "refType" : "refId", "refType and refId must be provided together.");
   }
   if (hasQuery) {
     // Keyword search keeps the frozen parser's exact validation (including the
@@ -457,6 +494,8 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
       data: {
         query: parsed.data.query,
         timeHorizon,
+        refType,
+        refId,
         includeVoided: parsed.data.includeVoided,
         limit: parsed.data.limit,
         offset: parsed.data.offset,
@@ -488,7 +527,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
     }
     offset = value;
   }
-  return { ok: true, data: { query: undefined, timeHorizon, includeVoided, limit, offset } };
+  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, includeVoided, limit, offset } };
 }
 
 function timestamp(): string {
@@ -566,13 +605,14 @@ function toDecisionRecord(row: DecisionRow): DecisionRecord {
   };
 }
 
-/** Extended view for getDecision (task-377). Revision snapshots deliberately
- * keep the frozen DecisionRecord shape via toDecisionRecord. */
-function toDecisionRecordView(row: DecisionRow): DecisionRecordView {
+/** Extended view for getDecision (task-377/393). Revision snapshots
+ * deliberately keep the frozen DecisionRecord shape via toDecisionRecord. */
+function toDecisionRecordView(row: DecisionRow, refs: DecisionRef[]): DecisionRecordView {
   return {
     ...toDecisionRecord(row),
     externalId: row.externalId,
     replaces: row.replacesJson === null ? null : JSON.parse(row.replacesJson) as number[],
+    refs,
   };
 }
 
@@ -1355,7 +1395,13 @@ export class SQLiteDecisionStore {
         [parsed.data.decisionId, projectId.data],
       );
       if (row === undefined) return failure("DECISION_NOT_FOUND", "Decision was not found.");
-      return { ok: true, data: toDecisionRecordView(row) };
+      // task-393: the record carries its own outgoing edges, so decision_get
+      // alone answers "does this decision reference a task" (and which ones).
+      const refs = many<{ refType: DecisionRefType; refKey: string }>(this.database,
+        "SELECT ref_type AS refType, ref_key AS refKey FROM decision_refs WHERE decision_id = ? ORDER BY id",
+        [parsed.data.decisionId],
+      ).map((edge) => ({ type: edge.refType, id: edge.refKey }));
+      return { ok: true, data: toDecisionRecordView(row, refs) };
     } catch (error) {
       return sqliteFailure(error);
     }
@@ -1368,13 +1414,20 @@ export class SQLiteDecisionStore {
     if (!parsed.ok) return parsed;
     this.assertOpen();
 
-    const { query, timeHorizon, includeVoided, limit, offset } = parsed.data;
+    const { query, timeHorizon, refType, refId, includeVoided, limit, offset } = parsed.data;
     const whereParts = ["project_id = ?"];
     const values: BindValue[] = [projectId.data];
     if (!includeVoided) whereParts.push("status = 'effective'");
     if (timeHorizon !== undefined) {
       whereParts.push("time_horizon = ?");
       values.push(timeHorizon);
+    }
+    if (refType !== undefined && refId !== undefined) {
+      // task-393 ③: the reverse query. The subquery is exactly the
+      // idx_decision_refs_reverse(ref_type, ref_key) access path: "which
+      // decisions reference this key" (requirements §11 item 3).
+      whereParts.push("id IN (SELECT decision_id FROM decision_refs WHERE ref_type = ? AND ref_key = ?)");
+      values.push(refType, refId);
     }
     if (query !== undefined) {
       const pattern = escapeLikeLiteral(query);

@@ -487,3 +487,57 @@ test("T377: tool schemas expose the extension fields and keep bl out of the enum
   assert.ok(searchData.properties.decisions.items.properties.timeHorizon !== undefined);
 });
 
+// --------------------------------------------------- task-393 refs-of surface
+
+test("T393: decision_get exposes refs and decision_search answers the reverse query", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const get = tools.get("decision_get");
+  const search = tools.get("decision_search");
+
+  const created = await invoke(create, root, { decision: "has downstream", refs: [{ type: "task", id: "T-194" }] });
+  assert.equal(created.value.ok, true, JSON.stringify(created.value));
+  const id = created.value.data.decisionId;
+
+  const got = await invoke(get, root, { decisionId: id });
+  assert.equal(got.value.ok, true, JSON.stringify(got.value));
+  assert.deepEqual(got.value.data.refs, [{ type: "task", id: "T-194" }]);
+
+  const bare = await invoke(create, root, { decision: "no downstream" });
+  const bareGot = await invoke(get, root, { decisionId: bare.value.data.decisionId });
+  assert.deepEqual(bareGot.value.data.refs, []);
+
+  const reverse = await invoke(search, root, { refType: "task", refId: "T-194" });
+  assert.equal(reverse.value.ok, true, JSON.stringify(reverse.value));
+  assert.deepEqual(reverse.value.data.decisions.map((d) => d.decisionId), [id]);
+
+  const empty = await invoke(search, root, { refType: "task", refId: "T-000" });
+  assert.equal(empty.value.ok, true, JSON.stringify(empty.value));
+  assert.deepEqual(empty.value.data.decisions, []);
+
+  // Direction consistency at the tool face: bl is rejected as a filter type.
+  const reversed = await invoke(search, root, { refType: "bl", refId: "BL-584" });
+  assert.equal(reversed.value.ok, false);
+  assert.equal(reversed.value.error.code, "VALIDATION_FAILED");
+  assert.equal(reversed.value.error.field, "refType");
+  const half = await invoke(search, root, { refType: "task" });
+  assert.equal(half.value.ok, false);
+  assert.equal(half.value.error.field, "refId");
+});
+
+test("T393: schemas expose refs on get and the reverse filter on search", () => {
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  const byName = new Map(createDecisionTools(deps).map((tool) => [tool.name, tool]));
+  const getData = byName.get("decision_get").output.schema.properties.data;
+  assert.ok(getData.properties.refs !== undefined, "get output declares refs");
+  assert.deepEqual(getData.properties.refs.items.properties.type.enum, ["decision", "task", "plan", "commit"]);
+  const searchParams = byName.get("decision_search").parameters;
+  assert.notEqual(searchParams.refType.required, true, "refType is optional");
+  assert.notEqual(searchParams.refId.required, true, "refId is optional");
+  assert.deepEqual(searchParams.refType.enum, ["decision", "task", "plan", "commit"]);
+  assert.ok(!searchParams.refType.enum.includes("bl"), "the direction rule is visible in the filter schema");
+  assert.match(byName.get("decision_search").description, /refType and refId/i);
+  assert.match(byName.get("decision_get").description, /refs/i);
+});
+

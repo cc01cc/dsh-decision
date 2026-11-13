@@ -354,6 +354,17 @@ const DECISION_RECORD: SchemaNode = objectNode({
   updatedAt: prop(STRING, true, "Last update timestamp."),
   externalId: prop(NULLABLE, true, "External idempotency key, or null when created without one."),
   replaces: prop({ oneOf: [{ type: "array", items: INTEGER }, { type: "null" }] }, true, "DSD numbers this decision replaces, or null."),
+  refs: prop(
+    {
+      type: "array",
+      items: objectNode({
+        type: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, true, "What the reference points at."),
+        id: prop(STRING, true, "External key of the referenced item."),
+      }),
+    },
+    true,
+    "The decision's typed references in insertion order; empty when none. Check for a type to answer whether the decision has a downstream task.",
+  ),
 });
 
 // ---------------------------------------------------------------------------
@@ -366,11 +377,13 @@ const DECISION_RECORD: SchemaNode = objectNode({
 
 /** decision_search (contract lines 110-143). */
 const SEARCH_DESCRIPTION =
-"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards.";
+"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards.";
 
 const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
   query: prop(STRING, false, "1–500 code points, not blank; an empty string is rejected. Omit query to list recent decisions in recency order (the default list). Searches summary, decision, rationale and source reference."),
   timeHorizon: prop({ type: "string", enum: [...HORIZON] }, false, "Restrict results to long_term or temporary; use it to list the two horizons separately."),
+  refType: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, false, "Reverse query: only decisions referencing this type of item. Provide together with refId; bl is not a valid type (direction rule)."),
+  refId: prop(STRING, false, "Reverse query: external key of the referenced item (e.g. T-194, D-1119, a commit sha), 1–200 code points. Provide together with refType; answers which decisions reference this key."),
   includeVoided: prop({ type: "boolean" }, false, "Include voided decisions; default false."),
   limit: prop(INTEGER, false, "Page size 1–20; default 10."),
   offset: prop(INTEGER, false, "Non-negative safe integer; default 0. Increase it to page."),
@@ -378,7 +391,7 @@ const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
 
 /** decision_get (contract lines 145-177). */
 const GET_DESCRIPTION =
-"Read one complete decision, including its current status and revision, from the current session's project by DSD number. Voided decisions remain readable. A decision that does not exist here is reported the same way as one that belongs elsewhere.";
+"Read one complete decision, including its current status, revision and typed refs, from the current session's project by DSD number. The refs list answers whether the decision has a downstream task (filter it by type). Voided decisions remain readable. A decision that does not exist here is reported the same way as one that belongs elsewhere.";
 
 const GET_PARAMETERS: Record<string, SchemaNode> = {
   decisionId: prop(INTEGER, true, "Positive integer DSD number shown in search results."),
