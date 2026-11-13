@@ -103,7 +103,9 @@ async function invoke(tool, agent, args) {
 test("T2.1: the six tools register in contract order with distinct names", () => {
   const registered = [];
   const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
-  registerDecisionTools({ register: (definition) => registered.push(definition.name) }, deps);
+  // task-388 (D-1238): the identity compile keeps this stand-in sink correct
+  // both before and after registerDecisionTools gains its required compile arg.
+  registerDecisionTools({ register: (definition) => registered.push(definition.name) }, deps, (definition) => definition);
   // Contract order: lines 110, 145, 179, 212, 258, 292.
   assert.deepEqual(registered, [
     "decision_search",
@@ -369,3 +371,119 @@ test("T2.1: each write tool refuses a missing project and a stale revision witho
     assert.equal(outcome.value.error.code, "DECISION_NOT_FOUND", name);
   }
 });
+
+// --------------------------------------------------- task-377 tool surface
+
+/** Bind one session to a fresh project and return the six tools plus the agent. */
+function boundTools(t, store) {
+  const root = liveAgent("session-377");
+  const asker = chooserFor("Atlas · atlas");
+  const deps = { agents: registryOf([root]), openStore: () => store, asker };
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+  store.bindSession("session-377", 1);
+  return { root, tools: new Map(createDecisionTools(deps).map((tool) => [tool.name, tool])) };
+}
+
+test("T377: decision_create dedupes by externalId and decision_get exposes the new fields", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const first = await invoke(create, root, { decision: "Use SQLite.", externalId: "D-1120", refs: [{ type: "task", id: "T-194" }] });
+  assert.equal(first.value.ok, true, JSON.stringify(first.value));
+  assert.equal(first.value.data.externalId, "D-1120");
+  assert.equal(first.value.data.alreadyExisted, false);
+
+  const repeat = await invoke(create, root, { decision: "Different text.", externalId: "D-1120" });
+  assert.equal(repeat.value.ok, true, JSON.stringify(repeat.value));
+  assert.equal(repeat.value.data.decisionId, first.value.data.decisionId);
+  assert.equal(repeat.value.data.alreadyExisted, true);
+
+  const got = await invoke(tools.get("decision_get"), root, { decisionId: first.value.data.decisionId });
+  assert.equal(got.value.ok, true, JSON.stringify(got.value));
+  assert.equal(got.value.data.externalId, "D-1120");
+  assert.equal(got.value.data.timeHorizon, "long_term", "the tool face defaults to long_term");
+  assert.equal(got.value.data.replaces, null);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 1);
+});
+
+test("T377: decision_create rejects a reversed bl reference through the tool face", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const reversed = await invoke(tools.get("decision_create"), root, { decision: "wrong direction", refs: [{ type: "bl", id: "BL-584" }] });
+  assert.equal(reversed.value.ok, false, JSON.stringify(reversed.value));
+  assert.equal(reversed.value.error.code, "VALIDATION_FAILED");
+  assert.equal(reversed.value.error.field, "refs");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0);
+});
+
+test("T377: decision_create_batch re-run dedupes by externalId through the tool face", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const batch = tools.get("decision_create_batch");
+  const rows = { decisions: [{ decision: "a", externalId: "D-20" }, { decision: "b", externalId: "D-21" }] };
+  const first = await invoke(batch, root, rows);
+  assert.equal(first.value.ok, true, JSON.stringify(first.value));
+  assert.equal(first.value.data.createdCount, 2);
+  const again = await invoke(batch, root, rows);
+  assert.equal(again.value.ok, true, JSON.stringify(again.value));
+  assert.equal(again.value.data.createdCount, 0);
+  assert.deepEqual(again.value.data.decisions.map((d) => d.decisionId), first.value.data.decisions.map((d) => d.decisionId));
+  assert.ok(again.value.data.decisions.every((d) => d.alreadyExisted === true));
+});
+
+test("T377: decision_search lists without a query and filters by timeHorizon", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const search = tools.get("decision_search");
+  await invoke(create, root, { decision: "long ruling" });
+  await invoke(create, root, { decision: "temp ruling", timeHorizon: "temporary" });
+
+  const list = await invoke(search, root, {});
+  assert.equal(list.value.ok, true, JSON.stringify(list.value));
+  assert.equal(list.value.data.decisions.length, 2);
+  assert.ok(list.value.data.decisions.every((d) => d.timeHorizon === "long_term" || d.timeHorizon === "temporary"));
+
+  const temporary = await invoke(search, root, { timeHorizon: "temporary" });
+  assert.equal(temporary.value.ok, true, JSON.stringify(temporary.value));
+  assert.equal(temporary.value.data.decisions.length, 1);
+  assert.equal(temporary.value.data.decisions[0].timeHorizon, "temporary");
+
+  // The frozen rejection of an empty query string survives at the tool face.
+  const emptyQuery = await invoke(search, root, { query: "" });
+  assert.equal(emptyQuery.value.ok, false);
+  assert.equal(emptyQuery.value.error.code, "VALIDATION_FAILED");
+  assert.equal(emptyQuery.value.error.field, "query");
+});
+
+test("T377: tool schemas expose the extension fields and keep bl out of the enum", () => {
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  const byName = new Map(createDecisionTools(deps).map((tool) => [tool.name, tool]));
+  const createParams = byName.get("decision_create").parameters;
+  for (const field of ["externalId", "refs", "replaces"]) {
+    assert.ok(createParams[field] !== undefined, "create parameter " + field);
+    assert.notEqual(createParams[field].required, true, field + " is optional");
+  }
+  const refType = createParams.refs.items.properties.type;
+  assert.deepEqual(refType.enum, ["decision", "task", "plan", "commit"]);
+  assert.ok(!refType.enum.includes("bl"), "the direction rule is visible in the schema");
+  assert.equal(createParams.timeHorizon.description.includes("long_term"), true);
+
+  const batchParams = byName.get("decision_create_batch").parameters;
+  assert.ok(batchParams.decisions.items.properties.externalId !== undefined);
+
+  const searchParams = byName.get("decision_search").parameters;
+  assert.notEqual(searchParams.query.required, true, "query is optional: omission lists");
+  assert.deepEqual(searchParams.timeHorizon.enum, ["long_term", "temporary"]);
+
+  const createData = byName.get("decision_create").output.schema.properties.data;
+  assert.ok(createData.properties.externalId !== undefined);
+  assert.ok(createData.properties.alreadyExisted !== undefined);
+  const getData = byName.get("decision_get").output.schema.properties.data;
+  assert.ok(getData.properties.externalId !== undefined);
+  assert.ok(getData.properties.replaces !== undefined);
+  const searchData = byName.get("decision_search").output.schema.properties.data;
+  assert.ok(searchData.properties.decisions.items.properties.timeHorizon !== undefined);
+});
+

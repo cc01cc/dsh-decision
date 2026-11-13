@@ -335,3 +335,481 @@ test("history returns snapshots newest first with the pre-change revision", (t) 
   assert.equal(history[0].snapshot.decision, "v3");
   assert.equal(history[2].snapshot.decision, "v1");
 });
+
+// ---------------------------------------------------------------------------
+// task-377 ①: external_id idempotency key (requirements §10.2). The only one of
+// the four current requirements whose absence permanently produces dirty data:
+// this store has no physical delete, so a duplicate row can never be removed.
+// ---------------------------------------------------------------------------
+
+test("create with externalId echoes the key and dedupes a repeated create", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const first = dataOf(store.createDecision(p.projectId, { decision: "original ruling", externalId: "D-1120" }));
+  assert.equal(first.externalId, "D-1120");
+  assert.equal(first.alreadyExisted, false);
+  assert.equal(first.revision, 1);
+  assert.equal(first.status, "effective");
+
+  // Same key, DIFFERENT content: the existing record is returned, not a second row.
+  const repeat = dataOf(store.createDecision(p.projectId, { decision: "totally different text", externalId: "D-1120" }));
+  assert.equal(repeat.decisionId, first.decisionId);
+  assert.equal(repeat.alreadyExisted, true);
+  assert.equal(repeat.externalId, "D-1120");
+  assert.equal(repeat.createdAt, first.createdAt);
+  const current = dataOf(store.getDecision(p.projectId, { decisionId: first.decisionId }));
+  assert.equal(current.decision, "original ruling", "the original content is untouched");
+  assert.equal(current.externalId, "D-1120");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 1);
+});
+
+test("dedupe returns the existing record's current revision and status", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const first = dataOf(store.createDecision(p.projectId, { decision: "v1", externalId: "D-1" }));
+  dataOf(store.updateDecision(p.projectId, { decisionId: first.decisionId, expectedRevision: 1, patch: { decision: "v2" } }));
+  const afterUpdate = dataOf(store.createDecision(p.projectId, { decision: "dup", externalId: "D-1" }));
+  assert.equal(afterUpdate.decisionId, first.decisionId);
+  assert.equal(afterUpdate.revision, 2, "the caller must receive the revision to pass as expectedRevision");
+  assert.equal(afterUpdate.status, "effective");
+
+  dataOf(store.voidDecision(p.projectId, { decisionId: first.decisionId, expectedRevision: 2, reason: "withdrawn" }));
+  const afterVoid = dataOf(store.createDecision(p.projectId, { decision: "dup", externalId: "D-1" }));
+  assert.equal(afterVoid.decisionId, first.decisionId);
+  assert.equal(afterVoid.status, "voided");
+  assert.equal(afterVoid.revision, 3);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 1);
+});
+
+test("external_id uniqueness spans projects inside one Profile database", (t) => {
+  const store = storeFor(t);
+  const a = project(store, "Atlas", "atlas");
+  const b = project(store, "Borealis", "borealis");
+  const first = dataOf(store.createDecision(a.projectId, { decision: "in atlas", externalId: "D-77" }));
+  const other = dataOf(store.createDecision(b.projectId, { decision: "in borealis", externalId: "D-77" }));
+  assert.equal(other.decisionId, first.decisionId, "the ledger key identifies one record Profile-wide");
+  assert.equal(other.alreadyExisted, true);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 1);
+});
+
+test("create without externalId keeps exactly the frozen receipt shape", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const receipt = dataOf(store.createDecision(p.projectId, { decision: "plain" }));
+  assert.deepEqual(Object.keys(receipt).sort(), ["createdAt", "decisionId", "revision", "status", "summary"]);
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: receipt.decisionId }));
+  assert.equal(got.externalId, null);
+  assert.equal(got.replaces, null);
+});
+
+test("invalid externalId values are rejected with field externalId and write nothing", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const badValues = ["", "   ", "\u0000", "x".repeat(201), 42, null, {}, ["D-1"]];
+  for (const value of badValues) {
+    const result = store.createDecision(p.projectId, { decision: "ok", externalId: value });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "externalId", JSON.stringify(value));
+    assert.equal(result.error.itemIndex, undefined);
+  }
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+  // 200 code points is the accepted upper bound (counted in code points).
+  const ok = dataOf(store.createDecision(p.projectId, { decision: "ok", externalId: "🐉".repeat(200) }));
+  assert.equal(ok.externalId, "🐉".repeat(200));
+});
+
+test("batch dedupes within one batch and across batches after an interrupted run", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+
+  // Within-batch: the third row repeats the first row's key.
+  const mixed = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "x", externalId: "D-10" },
+    { decision: "y", externalId: "D-11" },
+    { decision: "x again", externalId: "D-10" },
+  ] }));
+  assert.equal(mixed.createdCount, 2, "deduplicated rows are not counted as created");
+  assert.equal(mixed.decisions.length, 3, "one entry per submitted row");
+  assert.equal(mixed.decisions[2].alreadyExisted, true);
+  assert.equal(mixed.decisions[2].decisionId, mixed.decisions[0].decisionId);
+  assert.equal(mixed.decisions[2].revision, 1);
+  assert.equal(mixed.decisions[1].alreadyExisted, false);
+
+  // Across batches: a batch interrupted mid-run (row 3 fails a persisted CHECK
+  // via an injected trigger) rolls back; re-submitting the same keys must not
+  // duplicate the rows that an earlier successful batch already committed.
+  const committed = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "a", externalId: "D-20" },
+    { decision: "b", externalId: "D-21" },
+  ] }));
+  assert.equal(committed.createdCount, 2);
+  store.database.exec(`
+    CREATE TEMP TRIGGER fail_third BEFORE INSERT ON decisions
+    WHEN NEW.decision_text = 'boom'
+    BEGIN SELECT RAISE(ABORT, 'CHECK constraint failed: ck_decisions_text'); END;
+  `);
+  const interrupted = store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "c", externalId: "D-22" },
+    { decision: "boom", externalId: "D-23" },
+  ] });
+  errorOf(interrupted, "VALIDATION_FAILED");
+  store.database.exec("DROP TRIGGER fail_third");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 4, "the failed batch left nothing behind");
+
+  // Re-run BOTH batches exactly as submitted: nothing new may be created.
+  const rerun1 = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "a", externalId: "D-20" },
+    { decision: "b", externalId: "D-21" },
+  ] }));
+  assert.equal(rerun1.createdCount, 0);
+  assert.deepEqual(rerun1.decisions.map((d) => d.decisionId), committed.decisions.map((d) => d.decisionId));
+  assert.ok(rerun1.decisions.every((d) => d.alreadyExisted === true));
+  const rerun2 = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "c", externalId: "D-22" },
+    { decision: "c fixed", externalId: "D-23" },
+  ] }));
+  assert.equal(rerun2.createdCount, 2, "the interrupted batch's keys were never committed");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 6);
+});
+
+test("848-row migration in 9 batches is idempotent on a full re-run", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const rows = Array.from({ length: 848 }, (_, i) => ({
+    decision: "migrated decision " + i,
+    externalId: "D-" + (90000 + i),
+  }));
+  const batches = [];
+  for (let start = 0; start < rows.length; start += 100) batches.push(rows.slice(start, start + 100));
+  assert.equal(batches.length, 9, "848 rows at <=100 per batch is 9 batches");
+
+  const firstIds = [];
+  for (const batch of batches) {
+    const receipt = dataOf(store.createDecisionsBatch(p.projectId, { decisions: batch }));
+    assert.equal(receipt.createdCount, batch.length);
+    firstIds.push(...receipt.decisions.map((d) => d.decisionId));
+  }
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 848);
+
+  // The whole migration re-runs (the real failure mode: the runner died between
+  // batches and nobody knows which batches landed). Every row dedupes.
+  const againIds = [];
+  for (const batch of batches) {
+    const receipt = dataOf(store.createDecisionsBatch(p.projectId, { decisions: batch }));
+    assert.equal(receipt.createdCount, 0, "a re-run batch creates nothing");
+    assert.ok(receipt.decisions.every((d) => d.alreadyExisted === true));
+    againIds.push(...receipt.decisions.map((d) => d.decisionId));
+  }
+  assert.deepEqual(againIds, firstIds, "re-run resolves to exactly the same DSD numbers");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 848);
+});
+
+test("batch rows without externalId keep the frozen entry shape and are not deduplicated", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const receipt = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [{ decision: "a" }, { decision: "b" }] }));
+  assert.equal(receipt.createdCount, 2);
+  for (const entry of receipt.decisions) {
+    assert.deepEqual(Object.keys(entry).sort(), ["decisionId", "index", "revision"]);
+    assert.equal(entry.revision, 1);
+  }
+  const again = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [{ decision: "a" }, { decision: "b" }] }));
+  assert.equal(again.createdCount, 2, "without a key a repeated batch duplicates, exactly as before");
+});
+
+test("batch extension validation reports itemIndex and rolls the whole batch back", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const badKey = store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "ok", externalId: "D-30" },
+    { decision: "ok", externalId: "" },
+  ] });
+  errorOf(badKey, "VALIDATION_FAILED");
+  assert.equal(badKey.error.field, "externalId");
+  assert.equal(badKey.error.itemIndex, 2);
+  const badRefs = store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "ok", refs: [{ type: "bl", id: "BL-584" }] },
+  ] });
+  errorOf(badRefs, "VALIDATION_FAILED");
+  assert.equal(badRefs.error.field, "refs");
+  assert.equal(badRefs.error.itemIndex, 1);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0);
+});
+
+// ---------------------------------------------------------------------------
+// task-377 ②: refs direction rule (requirements §10.3). A decision may reference
+// plan/task/commit/decision, never bl; the reversed edge is rejected at write
+// time, and the reverse index exists for the requirement's own queries.
+// ---------------------------------------------------------------------------
+
+test("create stores the four allowed ref types and the reverse index answers refs-of", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, {
+    decision: "with references",
+    refs: [
+      { type: "decision", id: "D-1119" },
+      { type: "task", id: "T-194" },
+      { type: "plan", id: "PLAN-0769" },
+      { type: "commit", id: "a1b2c3d" },
+    ],
+  }));
+  const edges = store.database.prepare("SELECT ref_type, ref_key FROM decision_refs WHERE decision_id = ? ORDER BY id").all(created.decisionId)
+    .map((row) => ({ ref_type: row.ref_type, ref_key: row.ref_key }));
+  assert.deepEqual(edges, [
+    { ref_type: "decision", ref_key: "D-1119" },
+    { ref_type: "task", ref_key: "T-194" },
+    { ref_type: "plan", ref_key: "PLAN-0769" },
+    { ref_type: "commit", ref_key: "a1b2c3d" },
+  ]);
+  // The requirement consumes the reverse index directly (no query API needed):
+  // "which decisions reference this key" and "does this decision have a task ref".
+  const reverse = store.database.prepare("SELECT decision_id FROM decision_refs WHERE ref_type = ? AND ref_key = ?").all("task", "T-194")
+    .map((row) => ({ decision_id: row.decision_id }));
+  assert.deepEqual(reverse, [{ decision_id: created.decisionId }]);
+  const hasTask = store.database.prepare("SELECT 1 AS x FROM decision_refs WHERE decision_id = ? AND ref_type = 'task' LIMIT 1").get(created.decisionId);
+  assert.equal(hasTask.x, 1);
+  // A decision without refs answers "no downstream task".
+  const bare = dataOf(store.createDecision(p.projectId, { decision: "no refs" }));
+  const noTask = store.database.prepare("SELECT 1 AS x FROM decision_refs WHERE decision_id = ? AND ref_type = 'task' LIMIT 1").get(bare.decisionId);
+  assert.equal(noTask, undefined);
+});
+
+test("a decision referencing bl is rejected: the reversed direction never lands", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const reversed = store.createDecision(p.projectId, {
+    decision: "wrong direction",
+    refs: [{ type: "bl", id: "BL-584" }],
+  });
+  errorOf(reversed, "VALIDATION_FAILED");
+  assert.equal(reversed.error.field, "refs");
+  assert.match(reversed.error.message, /direction rule/i);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0);
+  // Mixed list: one reversed edge poisons the whole create.
+  const mixed = store.createDecision(p.projectId, {
+    decision: "mixed",
+    refs: [{ type: "task", id: "T-1" }, { type: "bl", id: "BL-2" }],
+  });
+  errorOf(mixed, "VALIDATION_FAILED");
+  assert.equal(mixed.error.field, "refs");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0);
+});
+
+test("the direction rule is structural: direct SQL cannot insert a bl edge either", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const created = dataOf(store.createDecision(p.projectId, { decision: "host" }));
+  assert.throws(
+    () => store.database.prepare("INSERT INTO decision_refs (decision_id, ref_type, ref_key, created_at) VALUES (?, 'bl', 'BL-584', '2026-11-14T00:00:00.000Z')").run(created.decisionId),
+    /CHECK constraint failed: ck_decision_refs_type/i,
+  );
+});
+
+test("invalid refs shapes are rejected with field refs", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const badLists = [
+    null,
+    "T-194",
+    {},
+    [null],
+    ["T-194"],
+    [{ type: "task" }],
+    [{ id: "T-194" }],
+    [{ type: "task", id: "T-194", extra: 1 }],
+    [{ type: "issue", id: "T-194" }],
+    [{ type: 42, id: "T-194" }],
+    [{ type: "task", id: "" }],
+    [{ type: "task", id: "   " }],
+    [{ type: "task", id: "a\u0000b" }],
+    [{ type: "task", id: "x".repeat(201) }],
+    [{ type: "task", id: 194 }],
+    [{ type: "task", id: "T-1" }, { type: "task", id: "T-1" }],
+  ];
+  for (const refs of badLists) {
+    const result = store.createDecision(p.projectId, { decision: "ok", refs });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "refs", JSON.stringify(refs));
+  }
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+  // An empty list is allowed and stores no edges.
+  const empty = dataOf(store.createDecision(p.projectId, { decision: "ok", refs: [] }));
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs WHERE decision_id = ?").get(empty.decisionId).n, 0);
+});
+
+test("refs commit atomically with the decision inside a batch", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  store.database.exec(`
+    CREATE TEMP TRIGGER fail_second BEFORE INSERT ON decisions
+    WHEN NEW.decision_text = 'boom'
+    BEGIN SELECT RAISE(ABORT, 'CHECK constraint failed: ck_decisions_text'); END;
+  `);
+  const result = store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "with refs", refs: [{ type: "task", id: "T-1" }] },
+    { decision: "boom" },
+  ] });
+  errorOf(result, "VALIDATION_FAILED");
+  store.database.exec("DROP TRIGGER fail_second");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs").get().n, 0, "no orphan edges survive the rollback");
+});
+
+// ---------------------------------------------------------------------------
+// task-377 ④: time_scope default long_term + replaces (requirements §10.4/§10.5).
+// ---------------------------------------------------------------------------
+
+test("omitting timeHorizon defaults to long_term; an explicit value still wins", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const defaulted = dataOf(store.createDecision(p.projectId, { decision: "defaulted" }));
+  assert.equal(dataOf(store.getDecision(p.projectId, { decisionId: defaulted.decisionId })).timeHorizon, "long_term");
+  const explicit = dataOf(store.createDecision(p.projectId, { decision: "explicit", timeHorizon: "temporary" }));
+  assert.equal(dataOf(store.getDecision(p.projectId, { decisionId: explicit.decisionId })).timeHorizon, "temporary");
+  const batch = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "batch default" },
+    { decision: "batch explicit", timeHorizon: "temporary" },
+  ] }));
+  const horizons = batch.decisions.map((d) => dataOf(store.getDecision(p.projectId, { decisionId: d.decisionId })).timeHorizon);
+  assert.deepEqual(horizons, ["long_term", "temporary"]);
+  // An explicit null is still rejected by the frozen parser (no coercion).
+  const nullHorizon = store.createDecision(p.projectId, { decision: "ok", timeHorizon: null });
+  errorOf(nullHorizon, "VALIDATION_FAILED");
+  assert.equal(nullHorizon.error.field, "timeHorizon");
+});
+
+test("replaces is written on the new record only; the old records are never modified", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const old1 = dataOf(store.createDecision(p.projectId, { decision: "old ruling one" }));
+  const old2 = dataOf(store.createDecision(p.projectId, { decision: "old ruling two" }));
+  const newer = dataOf(store.createDecision(p.projectId, { decision: "new ruling", replaces: [old1.decisionId, old2.decisionId] }));
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: newer.decisionId }));
+  assert.deepEqual(got.replaces, [old1.decisionId, old2.decisionId]);
+  for (const old of [old1, old2]) {
+    const current = dataOf(store.getDecision(p.projectId, { decisionId: old.decisionId }));
+    assert.equal(current.revision, 1, "the replaced record keeps its revision");
+    assert.equal(current.status, "effective", "the replaced record is not auto-voided");
+    assert.equal(current.replaces, null);
+  }
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_revisions").get().n, 0, "no snapshot is written on the old records");
+});
+
+test("invalid replaces values are rejected with field replaces", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const badValues = [null, "1", {}, [], [0], [-1], [1.5], ["1"], [1, 1], [Number.MAX_SAFE_INTEGER + 1], Array.from({ length: 101 }, (_, i) => i + 1)];
+  for (const replaces of badValues) {
+    const result = store.createDecision(p.projectId, { decision: "ok", replaces });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "replaces", JSON.stringify(replaces));
+  }
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+});
+
+test("replaces is a declaration: a not-yet-existing number is accepted and readable", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  // During a ledger migration the replaced decision may be imported later; the
+  // store records the claim without resolving it (documented semantics).
+  const created = dataOf(store.createDecision(p.projectId, { decision: "forward reference", replaces: [99999] }));
+  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId })).replaces, [99999]);
+});
+
+test("the default list separates temporary from long_term without a keyword", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const l1 = dataOf(store.createDecision(p.projectId, { decision: "long one" }));
+  const t1 = dataOf(store.createDecision(p.projectId, { decision: "temp one", timeHorizon: "temporary" }));
+  const l2 = dataOf(store.createDecision(p.projectId, { decision: "long two" }));
+  const v1 = dataOf(store.createDecision(p.projectId, { decision: "voided temp", timeHorizon: "temporary" }));
+  dataOf(store.voidDecision(p.projectId, { decisionId: v1.decisionId, expectedRevision: 1, reason: "done" }));
+
+  // No query at all: the default list, recency order, effective only.
+  const list = dataOf(store.searchDecisions(p.projectId, {}));
+  assert.deepEqual(list.decisions.map((d) => d.decisionId), [l2.decisionId, t1.decisionId, l1.decisionId]);
+  assert.ok(list.decisions.every((d) => d.timeHorizon === "long_term" || d.timeHorizon === "temporary"));
+  assert.equal(list.hasMore, false);
+
+  const temporary = dataOf(store.searchDecisions(p.projectId, { timeHorizon: "temporary" }));
+  assert.deepEqual(temporary.decisions.map((d) => d.decisionId), [t1.decisionId]);
+  const longTerm = dataOf(store.searchDecisions(p.projectId, { timeHorizon: "long_term" }));
+  assert.deepEqual(longTerm.decisions.map((d) => d.decisionId), [l2.decisionId, l1.decisionId]);
+
+  const withVoided = dataOf(store.searchDecisions(p.projectId, { timeHorizon: "temporary", includeVoided: true }));
+  assert.deepEqual(withVoided.decisions.map((d) => d.decisionId), [v1.decisionId, t1.decisionId]);
+
+  // Paging works on the default list exactly like on keyword search.
+  const page1 = dataOf(store.searchDecisions(p.projectId, { limit: 2 }));
+  assert.deepEqual(page1.decisions.map((d) => d.decisionId), [l2.decisionId, t1.decisionId]);
+  assert.equal(page1.hasMore, true);
+  const page2 = dataOf(store.searchDecisions(p.projectId, { limit: 2, offset: 2 }));
+  assert.deepEqual(page2.decisions.map((d) => d.decisionId), [l1.decisionId]);
+  assert.equal(page2.hasMore, false);
+
+  // Keyword search combines with the horizon filter; items carry timeHorizon.
+  const filtered = dataOf(store.searchDecisions(p.projectId, { query: "one", timeHorizon: "temporary" }));
+  assert.deepEqual(filtered.decisions.map((d) => d.decisionId), [t1.decisionId]);
+  assert.equal(filtered.decisions[0].timeHorizon, "temporary");
+});
+
+test("the default list validates like search and keeps the frozen rejections", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "seed" }));
+  const unknown = store.searchDecisions(p.projectId, { mystery: 1 });
+  errorOf(unknown, "VALIDATION_FAILED");
+  assert.equal(unknown.error.field, "mystery");
+  for (const [input, field] of [
+    [{ limit: 0 }, "limit"],
+    [{ limit: 21 }, "limit"],
+    [{ limit: 1.5 }, "limit"],
+    [{ offset: -1 }, "offset"],
+    [{ includeVoided: "yes" }, "includeVoided"],
+    [{ timeHorizon: "forever" }, "timeHorizon"],
+    [{ timeHorizon: null }, "timeHorizon"],
+  ]) {
+    const result = store.searchDecisions(p.projectId, input);
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, field, JSON.stringify(input));
+  }
+  // An EMPTY query string is still rejected (omission is the way to list).
+  const emptyQuery = store.searchDecisions(p.projectId, { query: "" });
+  errorOf(emptyQuery, "VALIDATION_FAILED");
+  assert.equal(emptyQuery.error.field, "query");
+  // Non-object input keeps the frozen parser's canonical error.
+  const nonObject = store.searchDecisions(p.projectId, "seed");
+  errorOf(nonObject, "VALIDATION_FAILED");
+});
+
+test("update and void never touch externalId/replaces; snapshots keep the frozen shape", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const old = dataOf(store.createDecision(p.projectId, { decision: "old" }));
+  const created = dataOf(store.createDecision(p.projectId, {
+    decision: "v1",
+    externalId: "D-500",
+    replaces: [old.decisionId],
+    refs: [{ type: "task", id: "T-500" }],
+  }));
+  dataOf(store.updateDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 1, patch: { decision: "v2" } }));
+  dataOf(store.voidDecision(p.projectId, { decisionId: created.decisionId, expectedRevision: 2, reason: "done" }));
+  const current = dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId }));
+  assert.equal(current.externalId, "D-500");
+  assert.deepEqual(current.replaces, [old.decisionId]);
+  assert.equal(current.status, "voided");
+  const history = dataOf(store.getDecisionHistory(p.projectId, created.decisionId));
+  assert.equal(history.length, 2);
+  for (const entry of history) {
+    assert.ok(!("externalId" in entry.snapshot), "snapshots keep the frozen DecisionRecord shape");
+    assert.ok(!("replaces" in entry.snapshot));
+  }
+  // The refs edge survives the void (it documents the decision's references).
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_refs WHERE decision_id = ?").get(created.decisionId).n, 1);
+  // externalId/replaces are not updatable through the frozen patch face.
+  const patchKey = store.updateDecision(p.projectId, { decisionId: old.decisionId, expectedRevision: 1, patch: { externalId: "D-999" } });
+  errorOf(patchKey, "VALIDATION_FAILED");
+});

@@ -26,10 +26,12 @@
  * PROJECT_REQUIRED (line 348).
  */
 
-import type { DecisionRecord, DomainErrorBody, DomainResult } from "../domain/decision-contract.ts";
+import type { DomainErrorBody, DomainResult } from "../domain/decision-contract.ts";
+import { DECISION_REF_TYPES } from "../storage/sqlite-store.ts";
 import type {
   DecisionBatchReceipt,
   DecisionCreateReceipt,
+  DecisionRecordView,
   DecisionRevisionRecord,
   DecisionSearchPage,
   DecisionUpdateReceipt,
@@ -118,10 +120,12 @@ export class DecisionToolRefusal extends Error {
   }
 }
 
-/** Store surface the six tools need (PLAN-0777 methods, zero new SQL). */
+/** Store surface the six tools need (PLAN-0777 methods; task-377 extends the
+ * create/search/get payloads without adding a seventh tool or a second write
+ * entry). */
 export interface DecisionToolStore extends FirstBindingStore {
   searchDecisions(projectId: number, input: unknown): DomainResult<DecisionSearchPage>;
-  getDecision(projectId: number, input: unknown): DomainResult<DecisionRecord>;
+  getDecision(projectId: number, input: unknown): DomainResult<DecisionRecordView>;
   getDecisionHistory(projectId: number, decisionId: number): DomainResult<DecisionRevisionRecord[]>;
   createDecision(projectId: number, input: unknown): DomainResult<DecisionCreateReceipt>;
   createDecisionsBatch(projectId: number, input: unknown): DomainResult<DecisionBatchReceipt>;
@@ -308,10 +312,27 @@ function sharedDecisionParameters(): Record<string, SchemaNode> {
     summary: prop(NULLABLE, false, "1–300 code points; null or omitted means no summary; an empty string is rejected."),
     decision: prop(STRING, true, "1–20,000 code points of plain multi-line text; must not be blank."),
     rationale: prop(NULLABLE, false, "Up to 20,000 code points; null or omitted means none."),
-    timeHorizon: prop({ type: "string", enum: [...HORIZON] }, false, "long_term or temporary; omitted defaults to temporary."),
+    timeHorizon: prop({ type: "string", enum: [...HORIZON] }, false, "long_term or temporary; omitted defaults to long_term."),
     decisionDate: prop(NULLABLE, false, "Calendar date YYYY-MM-DD, or null."),
     reviewDate: prop(NULLABLE, false, "Calendar date YYYY-MM-DD, or null; never triggers a status change."),
     sourceReference: prop(NULLABLE, false, "Up to 4,000 code points of plain text; never an identity or id mapping."),
+    externalId: prop(STRING, false, "Optional external idempotency key (e.g. a ledger id like D-1120), 1–200 code points. Repeating create with the same externalId returns the existing record instead of creating a duplicate; uniqueness spans the whole Profile database. Omit it when there is no external key."),
+    refs: prop(
+      {
+        type: "array",
+        items: objectNode({
+          type: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, true, "What the reference points at. A decision may reference plan, task, commit or decision — never bl (direction rule)."),
+          id: prop(STRING, true, "External key of the referenced item (e.g. T-194, D-1119, a commit sha), 1–200 code points; stored as given, not resolved."),
+        }),
+      },
+      false,
+      "Typed references attached to this decision. Reversed edges (type bl) are rejected.",
+    ),
+    replaces: prop(
+      { type: "array", items: INTEGER },
+      false,
+      "DSD numbers this new decision replaces, 1–100 positive integers. Written on the new record only; the old records are never modified.",
+    ),
   };
 }
 
@@ -331,6 +352,8 @@ const DECISION_RECORD: SchemaNode = objectNode({
   sourceReference: prop(NULLABLE, true, "Source text, or null."),
   createdAt: prop(STRING, true, "Creation timestamp."),
   updatedAt: prop(STRING, true, "Last update timestamp."),
+  externalId: prop(NULLABLE, true, "External idempotency key, or null when created without one."),
+  replaces: prop({ oneOf: [{ type: "array", items: INTEGER }, { type: "null" }] }, true, "DSD numbers this decision replaces, or null."),
 });
 
 // ---------------------------------------------------------------------------
@@ -343,10 +366,11 @@ const DECISION_RECORD: SchemaNode = objectNode({
 
 /** decision_search (contract lines 110-143). */
 const SEARCH_DESCRIPTION =
-"Find decisions in the current session's project by keyword. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards.";
+"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards.";
 
 const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
-  query: prop(STRING, true, "1–500 code points, not blank. Searches summary, decision, rationale and source reference."),
+  query: prop(STRING, false, "1–500 code points, not blank; an empty string is rejected. Omit query to list recent decisions in recency order (the default list). Searches summary, decision, rationale and source reference."),
+  timeHorizon: prop({ type: "string", enum: [...HORIZON] }, false, "Restrict results to long_term or temporary; use it to list the two horizons separately."),
   includeVoided: prop({ type: "boolean" }, false, "Include voided decisions; default false."),
   limit: prop(INTEGER, false, "Page size 1–20; default 10."),
   offset: prop(INTEGER, false, "Non-negative safe integer; default 0. Increase it to page."),
@@ -362,13 +386,13 @@ const GET_PARAMETERS: Record<string, SchemaNode> = {
 
 /** decision_create (contract lines 179-210). */
 const CREATE_DESCRIPTION =
-"Save one decision in the current session's project, only when the user explicitly asked for it. The required field is the decision content itself — do not invent a title. Fill summary only when a short summary genuinely helps. Never pass a source number or project number; use the returned DSD number afterwards.";
+"Save one decision in the current session's project, only when the user explicitly asked for it. The required field is the decision content itself — do not invent a title. Fill summary only when a short summary genuinely helps. When the decision has an external ledger id, pass it as externalId: repeating the create with the same externalId returns the existing record (alreadyExisted true) instead of creating a duplicate. Never pass a source number or project number; use the returned DSD number afterwards.";
 
 const CREATE_PARAMETERS = sharedDecisionParameters();
 
 /** decision_create_batch (contract lines 212-256). */
 const CREATE_BATCH_DESCRIPTION =
-"Save several decisions you have already organised, only when the user explicitly asked for them, each with the same fields as decision_create. One successful call commits the whole batch; any validation or write failure leaves nothing behind. Do not use a repeated call as a safe retry.";
+"Save several decisions you have already organised, only when the user explicitly asked for them, each with the same fields as decision_create. One successful call commits the whole batch; any validation or write failure leaves nothing behind. Rows carrying an externalId are idempotent: a row whose key already exists (including one created earlier in the same batch) is returned as alreadyExisted instead of duplicated, so a batch interrupted mid-run can be re-submitted safely. Rows without externalId are not deduplicated — do not re-submit them blindly.";
 
 const CREATE_BATCH_PARAMETERS: Record<string, SchemaNode> = {
   decisions: prop(
@@ -423,6 +447,7 @@ const SEARCH_DATA: SchemaNode = objectNode({
         decisionId: prop(INTEGER, true, "DSD number."),
         preview: prop(STRING, true, "Up to 240 code points."),
         status: prop({ type: "string", enum: [...STATUS] }, true, "effective or voided."),
+        timeHorizon: prop({ type: "string", enum: [...HORIZON] }, true, "long_term or temporary."),
       }),
     },
     true,
@@ -432,26 +457,30 @@ const SEARCH_DATA: SchemaNode = objectNode({
 });
 
 const CREATE_DATA: SchemaNode = objectNode({
-  decisionId: prop(INTEGER, true, "The new DSD number."),
-  revision: prop(INTEGER, true, "Always 1 for a new record."),
+  decisionId: prop(INTEGER, true, "The DSD number: new, or the existing record's when alreadyExisted is true."),
+  revision: prop(INTEGER, true, "1 for a new record; the existing record's revision when alreadyExisted is true."),
   summary: prop(NULLABLE, true, "The stored summary, or null."),
-  status: prop({ type: "string", enum: ["effective"] }, true, "New records are effective."),
+  status: prop({ type: "string", enum: [...STATUS] }, true, "effective for a new record; the existing record's status when alreadyExisted is true."),
   createdAt: prop(STRING, true, "Creation timestamp."),
+  externalId: prop(STRING, false, "Echoed only when the input carried externalId."),
+  alreadyExisted: prop({ type: "boolean" }, false, "Present only when the input carried externalId: true means an existing record was returned instead of creating a duplicate."),
 });
 
 const CREATE_BATCH_DATA: SchemaNode = objectNode({
-  createdCount: prop(INTEGER, true, "Number of records created by this call."),
+  createdCount: prop(INTEGER, true, "Number of records newly inserted by this call; rows returned as alreadyExisted are not counted."),
   decisions: prop(
     {
       type: "array",
       items: objectNode({
         index: prop(INTEGER, true, "1-based position in the submitted batch."),
-        decisionId: prop(INTEGER, true, "New DSD number."),
-        revision: prop(INTEGER, true, "Always 1 for a new record."),
+        decisionId: prop(INTEGER, true, "The DSD number: new, or the existing record's when alreadyExisted is true."),
+        revision: prop(INTEGER, true, "1 for a new record; the existing record's revision when alreadyExisted is true."),
+        externalId: prop(STRING, false, "Echoed only when the row carried externalId."),
+        alreadyExisted: prop({ type: "boolean" }, false, "Present only when the row carried externalId: true means an existing record was returned."),
       }),
     },
     true,
-    "One entry per created record.",
+    "One entry per submitted row, in input order.",
   ),
 });
 

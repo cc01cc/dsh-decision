@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SQLiteDecisionStore } from "../../src/storage/sqlite-store.ts";
@@ -111,11 +111,11 @@ test("requires an explicit absolute file path and never creates parent directori
   assert.equal(existsSync(paths.databasePath), false);
 });
 
-test("initializes four tables, named indexes, user_version, and required connection pragmas", (t) => {
+test("initializes five tables, named indexes, user_version, and required connection pragmas", (t) => {
   const { store } = storeFor(t);
   const database = store.database;
 
-  assert.equal(pragma(database, "user_version"), 1);
+  assert.equal(pragma(database, "user_version"), 2);
   assert.equal(String(pragma(database, "journal_mode")).toLowerCase(), "wal");
   assert.equal(pragma(database, "busy_timeout"), 5000);
   assert.equal(pragma(database, "foreign_keys"), 1);
@@ -126,7 +126,7 @@ test("initializes four tables, named indexes, user_version, and required connect
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
       (statement) => statement.all().map((row) => row.name),
     ),
-    ["decision_revisions", "decisions", "projects", "session_projects"],
+    ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"],
   );
   const indexes = withStatement(database,
     "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -139,6 +139,9 @@ test("initializes four tables, named indexes, user_version, and required connect
     "idx_session_projects_project_id",
     "idx_decisions_project_updated",
     "idx_decision_revisions_decision_created",
+    "uq_decisions_external_id",
+    "uq_decision_refs_edge",
+    "idx_decision_refs_reverse",
   ]) assert.ok(indexes.includes(index), `missing index ${index}`);
   const schemaSql = withStatement(database,
     "SELECT sql FROM sqlite_master WHERE type = 'table'",
@@ -153,7 +156,7 @@ test("initializes four tables, named indexes, user_version, and required connect
   const strictSupported = Number(sqliteVersion.split(".")[0]) > 3
     || (Number(sqliteVersion.split(".")[0]) === 3 && Number(sqliteVersion.split(".")[1]) >= 37);
   assert.equal(strictSupported, true, `unexpected SQLite version ${sqliteVersion}`);
-  for (const table of ["projects", "session_projects", "decisions", "decision_revisions"]) {
+  for (const table of ["projects", "session_projects", "decisions", "decision_revisions", "decision_refs"]) {
     assert.match(schemaSql, new RegExp(`CREATE TABLE \\b${table}\\b ([\\s\\S]*?)\\)\\s*STRICT`, "i"));
   }
   for (const constraint of [
@@ -172,11 +175,16 @@ test("initializes four tables, named indexes, user_version, and required connect
     "ck_decisions_void_state",
     "ck_decision_revisions_change_kind",
     "ck_decision_revisions_snapshot_json",
+    "ck_decisions_external_id",
+    "ck_decisions_replaces_json",
+    "ck_decision_refs_type",
+    "ck_decision_refs_key",
   ]) assert.match(schemaSql, new RegExp(`CONSTRAINT\\s+${constraint}\\s+CHECK`, "i"));
   for (const foreignKey of [
     "fk_session_projects_project_id",
     "fk_decisions_project_id",
     "fk_decision_revisions_decision_id",
+    "fk_decision_refs_decision_id",
   ]) assert.match(schemaSql, new RegExp(`CONSTRAINT\\s+${foreignKey}\\s+FOREIGN\\s+KEY`, "i"));
   assert.deepEqual(withStatement(database, "PRAGMA foreign_key_check", (statement) => statement.all()), []);
 });
@@ -314,7 +322,10 @@ test("create/get/search use project scope and literal LIKE matching", (t) => {
   const current = dataOf(store.getDecision(projectA.projectId, { decisionId: created.decisionId }));
   assert.equal(current.revision, 1);
   assert.equal(current.status, "effective");
-  assert.equal(current.timeHorizon, "temporary");
+  // task-377 ④: omitting timeHorizon now defaults to long_term (requirements
+  // §10.5); the frozen domain parser's historical temporary default is
+  // overridden at the store boundary.
+  assert.equal(current.timeHorizon, "long_term");
   assert.equal(current.summary, "A literal summary");
 
   const literal = dataOf(store.searchDecisions(projectA.projectId, { query: "100%_" }));
@@ -551,8 +562,146 @@ test("schema preflight rejects incompatible DELETE-mode files without changing p
   assertPreservedAfterRefusal(
     foreignKeyViolation.databasePath,
     /foreign key violations/i,
-    1,
-    ["decision_revisions", "decisions", "projects", "session_projects"],
+    2,
+    ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"],
     "SELECT session_id AS value FROM session_projects LIMIT 1",
   );
+});
+
+// ---------------------------------------------------------------------------
+// task-377: v1 -> v2 migration. The fixture is the exact schema the pre-task-377
+// store created (see fixtures/v1-schema.sql provenance header).
+// ---------------------------------------------------------------------------
+
+const V1_SCHEMA_SQL = readFileSync(new URL("./fixtures/v1-schema.sql", import.meta.url), "utf8");
+const V1_DECISION_COLUMNS = "id, revision, project_id, decision_text, summary, rationale, time_horizon, decision_date, review_date, status, void_reason, voided_at, source_reference, created_at, updated_at";
+
+function seedV1Database(databasePath) {
+  const seed = new DatabaseSync(databasePath);
+  seed.exec(V1_SCHEMA_SQL);
+  seed.exec("PRAGMA user_version = 1");
+  seed.exec(`
+    INSERT INTO projects (project_key, name, created_at, updated_at)
+      VALUES ('atlas', 'Atlas', '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z');
+    INSERT INTO session_projects (session_id, project_id, created_at, updated_at)
+      VALUES ('sess-1', 1, '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z');
+    INSERT INTO decisions (project_id, decision_text, summary, rationale, time_horizon,
+      decision_date, review_date, status, void_reason, voided_at, source_reference, created_at, updated_at)
+      VALUES (1, 'v1 effective decision', 'v1 summary', 'v1 rationale', 'temporary',
+        '2026-11-01', '2026-12-01', 'effective', NULL, NULL, 'ledger D-1',
+        '2026-11-01T00:00:00.000Z', '2026-11-02T00:00:00.000Z');
+    INSERT INTO decisions (project_id, decision_text, summary, rationale, time_horizon,
+      decision_date, review_date, status, void_reason, voided_at, source_reference, created_at, updated_at)
+      VALUES (1, 'v1 voided decision', NULL, NULL, 'long_term',
+        NULL, NULL, 'voided', 'superseded by D-2', '2026-11-03T00:00:00.000Z', NULL,
+        '2026-11-01T00:00:00.000Z', '2026-11-03T00:00:00.000Z');
+    UPDATE decisions SET revision = 3 WHERE id = 2;
+    INSERT INTO decision_revisions (decision_id, change_kind, snapshot_json, created_at)
+      VALUES (2, 'update', '{"decisionId":2,"revision":1}', '2026-11-02T00:00:00.000Z');
+    INSERT INTO decision_revisions (decision_id, change_kind, snapshot_json, created_at)
+      VALUES (2, 'void', '{"decisionId":2,"revision":2}', '2026-11-03T00:00:00.000Z');
+  `);
+  return seed;
+}
+
+function dumpV1Rows(database) {
+  return {
+    projects: database.prepare("SELECT * FROM projects ORDER BY id").all(),
+    sessions: database.prepare("SELECT * FROM session_projects ORDER BY id").all(),
+    decisions: database.prepare(`SELECT ${V1_DECISION_COLUMNS} FROM decisions ORDER BY id`).all(),
+    revisions: database.prepare("SELECT * FROM decision_revisions ORDER BY id").all(),
+  };
+}
+
+test("v1 database migrates to v2 in place, preserving every stored row", (t) => {
+  const paths = tempPath();
+  const seed = seedV1Database(paths.databasePath);
+  const before = dumpV1Rows(seed);
+  seed.close();
+
+  const store = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
+  t.after(() => store.close());
+  const database = store.database;
+
+  assert.equal(pragma(database, "user_version"), 2, "open migrates v1 to v2");
+  assert.deepEqual(
+    withStatement(database,
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      (statement) => statement.all().map((row) => row.name),
+    ),
+    ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"],
+  );
+  const indexes = withStatement(database,
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    (statement) => statement.all().map((row) => row.name),
+  );
+  for (const index of ["uq_decisions_external_id", "uq_decision_refs_edge", "idx_decision_refs_reverse"]) {
+    assert.ok(indexes.includes(index), `missing migrated index ${index}`);
+  }
+  assert.deepEqual(dumpV1Rows(database), before, "migration must not rewrite any stored v1 row");
+  assert.deepEqual(
+    database.prepare("SELECT external_id, replaces_json FROM decisions ORDER BY id").all()
+      .map((row) => ({ external_id: row.external_id, replaces_json: row.replaces_json })),
+    [{ external_id: null, replaces_json: null }, { external_id: null, replaces_json: null }],
+    "new columns start NULL on migrated rows",
+  );
+
+  // Reopening a migrated database does not migrate again.
+  const reopened = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
+  try {
+    assert.equal(pragma(reopened.database, "user_version"), 2);
+    assert.deepEqual(dumpV1Rows(reopened.database), before);
+  } finally {
+    reopened.close();
+  }
+
+  // v1 values survive through the store's read face, including the explicit
+  // temporary horizon (the new default must not rewrite stored rows).
+  const got = dataOf(store.getDecision(1, { decisionId: 1 }));
+  assert.equal(got.decision, "v1 effective decision");
+  assert.equal(got.timeHorizon, "temporary");
+  assert.equal(got.externalId, null);
+  assert.equal(got.replaces, null);
+  assert.equal(dataOf(store.getDecisionHistory(1, 2)).length, 2, "revision history intact");
+
+  // The migrated database accepts the new write faces.
+  const created = dataOf(store.createDecision(1, {
+    decision: "post-migration",
+    externalId: "D-9001",
+    refs: [{ type: "task", id: "T-1" }],
+    replaces: [1],
+  }));
+  assert.equal(created.alreadyExisted, false);
+  const again = dataOf(store.createDecision(1, { decision: "duplicate attempt", externalId: "D-9001" }));
+  assert.equal(again.decisionId, created.decisionId);
+  assert.equal(again.alreadyExisted, true);
+});
+
+test("a failed v1 migration rolls back completely and leaves the file at v1", (t) => {
+  const paths = tempPath();
+  const seed = seedV1Database(paths.databasePath);
+  // An object that already owns one of the migration's index names makes the
+  // migration fail mid-transaction (preflight allows extra v1 indexes).
+  seed.exec("CREATE UNIQUE INDEX uq_decisions_external_id ON decisions(id)");
+  const before = dumpV1Rows(seed);
+  seed.close();
+
+  assert.throws(() => SQLiteDecisionStore.open({ databasePath: paths.databasePath }), /already exists/i);
+
+  const check = new DatabaseSync(paths.databasePath);
+  try {
+    assert.equal(pragma(check, "user_version"), 1, "version must not advance on failure");
+    const columns = check.prepare("SELECT name FROM pragma_table_info('decisions') ORDER BY cid").all().map((row) => row.name);
+    assert.equal(columns.length, 15, "no partial column may survive the rollback");
+    assert.ok(!columns.includes("external_id"));
+    assert.ok(!columns.includes("replaces_json"));
+    const tables = withStatement(check,
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      (statement) => statement.all().map((row) => row.name),
+    );
+    assert.ok(!tables.includes("decision_refs"), "no partial table may survive the rollback");
+    assert.deepEqual(dumpV1Rows(check), before, "stored rows untouched by the failed migration");
+  } finally {
+    check.close();
+  }
 });

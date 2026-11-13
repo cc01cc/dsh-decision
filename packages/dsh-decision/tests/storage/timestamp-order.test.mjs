@@ -49,9 +49,11 @@ test("300-round pressure: no timestamp collisions and no wrong order", (t) => {
   assert.equal(wrongOrder, 0, "search must order by update recency");
 });
 
-// Criterion 3: no migration. Ticks are allocated at write time, so the schema is
-// untouched and every already-stored row keeps its exact updatedAt value.
-test("existing rows keep their stored updatedAt across reopen (no migration)", (t) => {
+// Criterion 3: reopening a current-version database performs no migration.
+// Ticks are allocated at write time, so every already-stored row keeps its exact
+// updatedAt value. (The task-377 v1->v2 migration is covered separately in
+// sqlite-store.test.mjs; it also preserves stored rows.)
+test("existing rows keep their stored updatedAt across reopen (no re-migration)", (t) => {
   const root = mkdtempSync(join(tmpdir(), "reopen-"));
   const databasePath = join(root, "d.sqlite");
   const store = SQLiteDecisionStore.open({ databasePath });
@@ -64,11 +66,12 @@ test("existing rows keep their stored updatedAt across reopen (no migration)", (
   try {
     const after = ids.map((id) => dataOf(reopened.getDecision(p.projectId, { decisionId: id })).updatedAt);
     assert.deepEqual(after, before, "updatedAt must not be rewritten on reopen");
-    assert.equal(reopened.database.prepare("PRAGMA user_version").get().user_version, 1, "schema version unchanged");
+    assert.equal(reopened.database.prepare("PRAGMA user_version").get().user_version, 2, "schema version unchanged");
     const columns = reopened.database.prepare("SELECT name FROM pragma_table_info('decisions') ORDER BY cid").all().map((row) => row.name);
     assert.deepEqual(columns, ["id", "revision", "project_id", "decision_text", "summary", "rationale",
       "time_horizon", "decision_date", "review_date", "status", "void_reason", "voided_at",
-      "source_reference", "created_at", "updated_at"], "no column was added and none was renamed");
+      "source_reference", "created_at", "updated_at", "external_id", "replaces_json"],
+    "task-377 appended exactly two columns; none was renamed");
   } finally { reopened.close(); cleanup(root); }
 });
 

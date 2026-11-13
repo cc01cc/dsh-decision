@@ -24,7 +24,14 @@ import type {
   TimeHorizon,
 } from "../domain/decision-contract.ts";
 
-const SCHEMA_VERSION = 1;
+// task-377 (requirements §10.2/§10.3/§10.4/§10.5, current four items): schema v2
+// adds the external idempotency key (external_id), typed reference edges
+// (decision_refs), and the replaces declaration (replaces_json). v1 databases
+// migrate in place; every stored v1 row keeps its exact values (the new columns
+// start NULL). The time_horizon column default for fresh databases becomes
+// long_term; migrated v1 databases keep their old column default, which the
+// store never reads because every insert passes time_horizon explicitly.
+const SCHEMA_VERSION = 2;
 const UNICODE_WHITE_SPACE_SQL = "char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)";
 
 export interface SQLiteDecisionStoreOptions {
@@ -43,10 +50,32 @@ export interface SessionBindingRecord extends ProjectRecord {
   sessionId: string;
 }
 
+/** The ref types a decision may carry (requirements §10.3 direction rule).
+ * 'bl' is deliberately absent: a decision must not reference a backlog item;
+ * only bl records may reference decisions. The decision_refs CHECK enforces
+ * this structurally, so a reversed edge is rejected at write time. */
+export const DECISION_REF_TYPES = ["decision", "task", "plan", "commit"] as const;
+export type DecisionRefType = (typeof DECISION_REF_TYPES)[number];
+
+export interface DecisionRef {
+  type: DecisionRefType;
+  id: string;
+}
+
+/** A decision record as returned by getDecision, extended with the task-377
+ * fields. The base shape stays the frozen domain DecisionRecord (revision
+ * snapshots keep exactly that shape). */
+export interface DecisionRecordView extends DecisionRecord {
+  externalId: string | null;
+  replaces: number[] | null;
+}
+
 export interface DecisionSearchItem {
   decisionId: number;
   preview: string;
   status: DecisionStatus;
+  /** task-377 ④: lets callers separate temporary from long-term decisions. */
+  timeHorizon: TimeHorizon;
 }
 
 export interface DecisionSearchPage {
@@ -56,15 +85,31 @@ export interface DecisionSearchPage {
 
 export interface DecisionCreateReceipt {
   decisionId: number;
-  revision: 1;
+  /** 1 for a new record; the existing record's revision when deduplicated. */
+  revision: number;
   summary: string | null;
-  status: "effective";
+  /** "effective" for a new record; the existing record's status when deduplicated. */
+  status: DecisionStatus;
   createdAt: string;
+  /** Present only when the input carried externalId. */
+  externalId?: string;
+  /** Present only when the input carried externalId: true means an existing
+   * record was returned instead of creating a duplicate (requirements §10.2). */
+  alreadyExisted?: boolean;
 }
 
 export interface DecisionBatchReceipt {
+  /** Number of records newly inserted by this call; rows returned as
+   * already-existed (external_id dedupe) are not counted. */
   createdCount: number;
-  decisions: Array<{ index: number; decisionId: number; revision: 1 }>;
+  decisions: Array<{
+    index: number;
+    decisionId: number;
+    /** 1 for a new record; the existing record's revision when deduplicated. */
+    revision: number;
+    externalId?: string;
+    alreadyExisted?: boolean;
+  }>;
 }
 
 export interface DecisionUpdateReceipt {
@@ -114,6 +159,18 @@ interface DecisionRow {
   sourceReference: string | null;
   createdAt: string;
   updatedAt: string;
+  externalId: string | null;
+  replacesJson: string | null;
+}
+
+/** Identity fields of an existing decision, used to answer an external_id
+ * dedupe hit without re-reading the row. */
+interface ExistingDecisionTarget {
+  decisionId: number;
+  revision: number;
+  summary: string | null;
+  status: DecisionStatus;
+  createdAt: string;
 }
 
 interface RevisionRow {
@@ -164,6 +221,274 @@ function validateSessionId(value: unknown): DomainResult<string> {
     return validationFailure("sessionId", "Expected a non-empty session identifier.");
   }
   return { ok: true, data: value };
+}
+
+// ---------------------------------------------------------------------------
+// task-377 input extensions.
+//
+// The domain parser (src/domain/decision-contract.ts) is a frozen contract and
+// rejects undeclared fields, so the new create fields (externalId, refs,
+// replaces) are split out HERE, validated with the same discipline (no coercion,
+// unknown fields rejected), and only the remaining base object is handed to the
+// frozen parser. The domain file is not modified; without the new fields every
+// call takes exactly the old path.
+// ---------------------------------------------------------------------------
+
+const CREATE_EXTENSION_FIELDS = new Set(["externalId", "refs", "replaces"]);
+
+/** The contract's White_Space set, identical to UNICODE_WHITE_SPACE_SQL above. */
+const CONTRACT_WHITE_SPACE = /[\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/u;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwnProperty(record: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, field);
+}
+
+function isBlankContract(value: string): boolean {
+  return Array.from(value).every((char) => CONTRACT_WHITE_SPACE.test(char));
+}
+
+function parseExternalId(value: unknown): DomainResult<string> {
+  if (typeof value !== "string") {
+    return validationFailure("externalId", "Expected a string of 1–200 code points; omit the field instead of passing null.");
+  }
+  if (value.includes("\u0000")) return validationFailure("externalId", "NUL is not allowed.");
+  const length = Array.from(value).length;
+  if (length < 1 || length > 200) return validationFailure("externalId", "Expected 1–200 Unicode code points.");
+  if (isBlankContract(value)) return validationFailure("externalId", "Must not be blank.");
+  return { ok: true, data: value };
+}
+
+function parseRefs(value: unknown): DomainResult<DecisionRef[]> {
+  if (!Array.isArray(value)) {
+    return validationFailure("refs", "Expected an array of {type, id} objects; omit the field instead of passing null.");
+  }
+  const refs: DecisionRef[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!isPlainRecord(item)) {
+      return validationFailure("refs", "Each ref must be an object with exactly type and id.");
+    }
+    const extra = Object.keys(item).find((key) => key !== "type" && key !== "id");
+    if (extra !== undefined) return validationFailure("refs", "Unknown field in a ref entry.");
+    if (typeof item.type !== "string" || !(DECISION_REF_TYPES as readonly string[]).includes(item.type)) {
+      // The direction rule (requirements §10.3): decision -> bl is the reversed
+      // edge the requirement wants rejected at write time, not discovered later.
+      return validationFailure("refs", "Expected ref type decision, task, plan or commit; a decision must not reference bl (direction rule).");
+    }
+    if (typeof item.id !== "string") {
+      return validationFailure("refs", "Expected ref id to be a string of 1–200 code points.");
+    }
+    if (item.id.includes("\u0000")) return validationFailure("refs", "NUL is not allowed.");
+    const idLength = Array.from(item.id).length;
+    if (idLength < 1 || idLength > 200) {
+      return validationFailure("refs", "Expected ref id of 1–200 Unicode code points.");
+    }
+    if (isBlankContract(item.id)) return validationFailure("refs", "Ref id must not be blank.");
+    const edge = `${item.type}\u0000${item.id}`;
+    if (seen.has(edge)) return validationFailure("refs", "Duplicate ref in the list.");
+    seen.add(edge);
+    refs.push({ type: item.type as DecisionRefType, id: item.id });
+  }
+  return { ok: true, data: refs };
+}
+
+function parseReplacesInput(value: unknown): DomainResult<number[]> {
+  if (!Array.isArray(value)) {
+    return validationFailure("replaces", "Expected an array of decision numbers; omit the field instead of passing null.");
+  }
+  if (value.length < 1 || value.length > 100) {
+    return validationFailure("replaces", "Expected 1–100 decision numbers.");
+  }
+  const ids: number[] = [];
+  const seen = new Set<number>();
+  for (const entry of value) {
+    if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry <= 0) {
+      return validationFailure("replaces", "Expected positive integer decision numbers.");
+    }
+    if (seen.has(entry)) return validationFailure("replaces", "Duplicate decision number in the list.");
+    seen.add(entry);
+    ids.push(entry);
+  }
+  return { ok: true, data: ids };
+}
+
+interface CreateExtensionSplit {
+  /** The input minus the extension fields, for the frozen domain parser. */
+  base: unknown;
+  externalId?: string;
+  refs?: DecisionRef[];
+  replaces?: number[];
+  /** True when the raw input omitted timeHorizon: the store default (long_term,
+   * requirements §10.5) applies instead of the frozen parser's historical
+   * temporary default. */
+  timeHorizonOmitted: boolean;
+}
+
+function parseCreateExtensions(input: unknown): DomainResult<CreateExtensionSplit> {
+  if (!isPlainRecord(input)) {
+    // Not an object: let the frozen parser produce the canonical error.
+    return { ok: true, data: { base: input, timeHorizonOmitted: false } };
+  }
+  const record = input;
+  let externalId: string | undefined;
+  if (hasOwnProperty(record, "externalId")) {
+    const parsed = parseExternalId(record.externalId);
+    if (!parsed.ok) return parsed;
+    externalId = parsed.data;
+  }
+  let refs: DecisionRef[] | undefined;
+  if (hasOwnProperty(record, "refs")) {
+    const parsed = parseRefs(record.refs);
+    if (!parsed.ok) return parsed;
+    refs = parsed.data;
+  }
+  let replaces: number[] | undefined;
+  if (hasOwnProperty(record, "replaces")) {
+    const parsed = parseReplacesInput(record.replaces);
+    if (!parsed.ok) return parsed;
+    replaces = parsed.data;
+  }
+  const base: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (!CREATE_EXTENSION_FIELDS.has(key)) base[key] = value;
+  }
+  return {
+    ok: true,
+    data: {
+      base,
+      ...(externalId === undefined ? {} : { externalId }),
+      ...(refs === undefined ? {} : { refs }),
+      ...(replaces === undefined ? {} : { replaces }),
+      timeHorizonOmitted: !hasOwnProperty(record, "timeHorizon") || record.timeHorizon === undefined,
+    },
+  };
+}
+
+interface BatchExtensionSplit {
+  base: unknown;
+  items: CreateExtensionSplit[];
+}
+
+function splitBatchInput(input: unknown): DomainResult<BatchExtensionSplit> {
+  if (!isPlainRecord(input) || !Array.isArray(input.decisions)
+    || input.decisions.length < 1 || input.decisions.length > 100) {
+    // Outer shape is invalid: let the frozen parser produce the canonical error
+    // (field "decisions" / "input", without row coordinates).
+    return { ok: true, data: { base: input, items: [] } };
+  }
+  const raw = input.decisions;
+  const bases: unknown[] = [];
+  const items: CreateExtensionSplit[] = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const split = parseCreateExtensions(raw[index]);
+    if (!split.ok) return { ok: false, error: { ...split.error, itemIndex: index + 1 } };
+    bases.push(split.data.base);
+    items.push(split.data);
+  }
+  return { ok: true, data: { base: { ...input, decisions: bases }, items } };
+}
+
+/** The decision fields plus the task-377 extensions, ready for insert. */
+interface DecisionInsertItem extends DecisionCreateInput {
+  externalId?: string;
+  refs?: DecisionRef[];
+  replaces?: number[];
+}
+
+function buildInsertItem(parsed: DecisionCreateInput, split: CreateExtensionSplit): DecisionInsertItem {
+  const item: DecisionInsertItem = {
+    ...parsed,
+    timeHorizon: split.timeHorizonOmitted ? "long_term" : parsed.timeHorizon,
+  };
+  if (split.externalId !== undefined) item.externalId = split.externalId;
+  if (split.refs !== undefined) item.refs = split.refs;
+  if (split.replaces !== undefined) item.replaces = split.replaces;
+  return item;
+}
+// ---------------------------------------------------------------------------
+// task-377 ④ search extensions: the default list and the timeHorizon filter.
+
+interface DecisionSearchParsedInput {
+  /** undefined means the caller omitted query: list recent decisions (the
+   * default list, requirements §10.5) instead of a keyword search. */
+  query: string | undefined;
+  timeHorizon: TimeHorizon | undefined;
+  includeVoided: boolean;
+  limit: number;
+  offset: number;
+}
+
+function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInput> {
+  if (!isPlainRecord(input)) {
+    // Preserve the frozen parser's canonical non-object error.
+    const passthrough = parseDecisionSearchInput(input);
+    if (passthrough.ok) throw new TypeError("The frozen search parser accepted a non-object input.");
+    return { ok: false, error: passthrough.error };
+  }
+  const rest: Record<string, unknown> = {};
+  let timeHorizon: TimeHorizon | undefined;
+  let hasQuery = false;
+  for (const [key, value] of Object.entries(input)) {
+    if (key === "timeHorizon") {
+      if (value !== "long_term" && value !== "temporary") {
+        return validationFailure("timeHorizon", "Expected 'long_term' or 'temporary'.");
+      }
+      timeHorizon = value;
+      continue;
+    }
+    if (key === "query") {
+      hasQuery = value !== undefined;
+      if (hasQuery) rest.query = value;
+      continue;
+    }
+    rest[key] = value;
+  }
+  if (hasQuery) {
+    // Keyword search keeps the frozen parser's exact validation (including the
+    // rejection of an empty query string); only timeHorizon was extracted.
+    const parsed = parseDecisionSearchInput(rest);
+    if (!parsed.ok) return parserFailure(parsed);
+    return {
+      ok: true,
+      data: {
+        query: parsed.data.query,
+        timeHorizon,
+        includeVoided: parsed.data.includeVoided,
+        limit: parsed.data.limit,
+        offset: parsed.data.offset,
+      },
+    };
+  }
+  // Default list: no keyword. Bounds mirror the frozen search parser exactly.
+  const allowed = new Set(["includeVoided", "limit", "offset"]);
+  const extra = Object.keys(rest).find((key) => !allowed.has(key));
+  if (extra !== undefined) return validationFailure(extra, "Unknown field.");
+  let includeVoided = false;
+  if (hasOwnProperty(rest, "includeVoided")) {
+    if (typeof rest.includeVoided !== "boolean") return validationFailure("includeVoided", "Expected a boolean.");
+    includeVoided = rest.includeVoided;
+  }
+  let limit = 10;
+  if (hasOwnProperty(rest, "limit")) {
+    const value = rest.limit;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 20) {
+      return validationFailure("limit", "Expected an integer from 1 to 20.");
+    }
+    limit = value;
+  }
+  let offset = 0;
+  if (hasOwnProperty(rest, "offset")) {
+    const value = rest.offset;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      return validationFailure("offset", "Expected a non-negative safe integer.");
+    }
+    offset = value;
+  }
+  return { ok: true, data: { query: undefined, timeHorizon, includeVoided, limit, offset } };
 }
 
 function timestamp(): string {
@@ -241,6 +566,40 @@ function toDecisionRecord(row: DecisionRow): DecisionRecord {
   };
 }
 
+/** Extended view for getDecision (task-377). Revision snapshots deliberately
+ * keep the frozen DecisionRecord shape via toDecisionRecord. */
+function toDecisionRecordView(row: DecisionRow): DecisionRecordView {
+  return {
+    ...toDecisionRecord(row),
+    externalId: row.externalId,
+    replaces: row.replacesJson === null ? null : JSON.parse(row.replacesJson) as number[],
+  };
+}
+
+function targetOfRow(row: DecisionRow): ExistingDecisionTarget {
+  return {
+    decisionId: row.decisionId,
+    revision: row.revision,
+    summary: row.summary,
+    status: row.status,
+    createdAt: row.createdAt,
+  };
+}
+
+/** The receipt returned when an external_id already exists (requirements
+ * §10.2): the caller receives the EXISTING record's identity, not a new row. */
+function receiptForExisting(target: ExistingDecisionTarget, externalId: string): DecisionCreateReceipt {
+  return {
+    decisionId: target.decisionId,
+    revision: target.revision,
+    summary: target.summary,
+    status: target.status,
+    createdAt: target.createdAt,
+    externalId,
+    alreadyExisted: true,
+  };
+}
+
 function decisionSelect(where: string): string {
   return `SELECT
     id AS decisionId,
@@ -257,7 +616,9 @@ function decisionSelect(where: string): string {
     voided_at AS voidedAt,
     source_reference AS sourceReference,
     created_at AS createdAt,
-    updated_at AS updatedAt
+    updated_at AS updatedAt,
+    external_id AS externalId,
+    replaces_json AS replacesJson
   FROM decisions ${where}`;
 }
 
@@ -293,6 +654,29 @@ function checkDate(column: string): string {
     AND strftime('%Y-%m-%d', ${column}, '+0 days') = ${column}
   ))`;
 }
+
+// task-377 ①: the external idempotency key. 1–200 code points, non-blank, no
+// NUL; NULL means "no external key". Uniqueness is enforced by a unique index
+// (SQLite allows multiple NULLs in a unique index, so keyless rows never clash).
+const EXTERNAL_ID_COLUMN_SQL = `external_id TEXT CONSTRAINT ck_decisions_external_id CHECK (
+    external_id IS NULL OR (
+      length(external_id) BETWEEN 1 AND 200
+      AND length(trim(external_id, ${UNICODE_WHITE_SPACE_SQL})) > 0
+      AND ${checkNoNul("external_id")}
+    )
+  )`;
+
+// task-377 ④: the replaces declaration, a JSON array of DSD decision numbers.
+// The CHECK is the structural backstop for direct SQL writes (valid JSON array);
+// element-level validation (positive safe integers, 1–100 entries, no repeats)
+// happens in the store before every insert.
+const REPLACES_JSON_COLUMN_SQL = `replaces_json TEXT CONSTRAINT ck_decisions_replaces_json CHECK (
+    replaces_json IS NULL OR (
+      json_valid(replaces_json)
+      AND json_type(replaces_json) = 'array'
+      AND length(replaces_json) BETWEEN 2 AND 100000
+    )
+  )`;
 
 const SCHEMA_SQL = `
 CREATE TABLE projects (
@@ -341,7 +725,7 @@ CREATE TABLE decisions (
   ),
   summary TEXT CONSTRAINT ck_decisions_summary CHECK (${checkText("summary", 1, 300)}),
   rationale TEXT CONSTRAINT ck_decisions_rationale_length CHECK (${checkText("rationale", 1, 20000)}),
-  time_horizon TEXT NOT NULL DEFAULT 'temporary'
+  time_horizon TEXT NOT NULL DEFAULT 'long_term'
     CONSTRAINT ck_decisions_time_horizon CHECK (time_horizon IN ('long_term', 'temporary')),
   decision_date TEXT CONSTRAINT ck_decisions_decision_date CHECK (${checkDate("decision_date")}),
   review_date TEXT CONSTRAINT ck_decisions_review_date CHECK (${checkDate("review_date")}),
@@ -352,6 +736,8 @@ CREATE TABLE decisions (
   source_reference TEXT CONSTRAINT ck_decisions_source_reference_length CHECK (${checkText("source_reference", 1, 4000)}),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  ${EXTERNAL_ID_COLUMN_SQL},
+  ${REPLACES_JSON_COLUMN_SQL},
   CONSTRAINT ck_decisions_void_state CHECK (
     (status = 'effective' AND void_reason IS NULL AND voided_at IS NULL)
     OR
@@ -365,6 +751,11 @@ CREATE TABLE decisions (
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
 )__STRICT__;
 CREATE INDEX idx_decisions_project_updated ON decisions(project_id, updated_at DESC, id DESC);
+CREATE UNIQUE INDEX uq_decisions_external_id ON decisions(external_id);
+
+__REFS_TABLE__
+CREATE UNIQUE INDEX uq_decision_refs_edge ON decision_refs(decision_id, ref_type, ref_key);
+CREATE INDEX idx_decision_refs_reverse ON decision_refs(ref_type, ref_key);
 
 CREATE TABLE decision_revisions (
   id INTEGER PRIMARY KEY,
@@ -381,6 +772,28 @@ CREATE INDEX idx_decision_revisions_decision_created
   ON decision_revisions(decision_id, created_at DESC, id DESC);
 `;
 
+// task-377 ②③: typed reference edges. The ref_type CHECK is the direction rule
+// (requirements §10.3): a decision may reference plan/task/commit/decision, never
+// bl. uq_decision_refs_edge makes each edge unique per decision;
+// idx_decision_refs_reverse is the reverse index (which decisions reference a
+// given key) that the requirement asks to exist without a query API.
+function decisionRefsTableSql(strict: boolean): string {
+  return `CREATE TABLE decision_refs (
+  id INTEGER PRIMARY KEY,
+  decision_id INTEGER NOT NULL,
+  ref_type TEXT NOT NULL CONSTRAINT ck_decision_refs_type
+    CHECK (ref_type IN ('decision', 'task', 'plan', 'commit')),
+  ref_key TEXT NOT NULL CONSTRAINT ck_decision_refs_key CHECK (
+    length(ref_key) BETWEEN 1 AND 200
+    AND length(trim(ref_key, ${UNICODE_WHITE_SPACE_SQL})) > 0
+    AND ${checkNoNul("ref_key")}
+  ),
+  created_at TEXT NOT NULL,
+  CONSTRAINT fk_decision_refs_decision_id
+    FOREIGN KEY (decision_id) REFERENCES decisions(id) ON DELETE RESTRICT
+)${strict ? " STRICT" : ""};`;
+}
+
 // SQLite 3.37+ parses the STRICT table suffix; older libraries must keep the
 // plain schema. The runtime is probed instead of assumed.
 function sqliteSupportsStrictTables(database: DatabaseSync): boolean {
@@ -393,8 +806,25 @@ function sqliteSupportsStrictTables(database: DatabaseSync): boolean {
 }
 
 function schemaSql(strict: boolean): string {
-  return SCHEMA_SQL.replaceAll("__STRICT__", strict ? "STRICT" : "");
+  return SCHEMA_SQL
+    .replaceAll("__STRICT__", strict ? "STRICT" : "")
+    .replace("__REFS_TABLE__", decisionRefsTableSql(strict));
 }
+
+// v1 -> v2 migration (task-377). ALTER TABLE ADD COLUMN appends the two new
+// columns (matching the fresh-schema column order) and leaves every stored row
+// untouched; existing rows get NULL external_id/replaces_json. The v1 column
+// default 'temporary' cannot be changed without a table rebuild, which is not
+// needed: every store insert passes time_horizon explicitly (long_term when the
+// caller omitted it).
+const MIGRATION_V1_TO_V2_SQL = `
+ALTER TABLE decisions ADD COLUMN ${EXTERNAL_ID_COLUMN_SQL};
+ALTER TABLE decisions ADD COLUMN ${REPLACES_JSON_COLUMN_SQL};
+CREATE UNIQUE INDEX uq_decisions_external_id ON decisions(external_id);
+__REFS_TABLE__
+CREATE UNIQUE INDEX uq_decision_refs_edge ON decision_refs(decision_id, ref_type, ref_key);
+CREATE INDEX idx_decision_refs_reverse ON decision_refs(ref_type, ref_key);
+`;
 
 function schemaTableNames(database: DatabaseSync): string[] {
   return many<{ name: string }>(database,
@@ -408,12 +838,25 @@ function schemaIndexNames(database: DatabaseSync): string[] {
   ).map((row) => row.name);
 }
 
-const EXPECTED_TABLES = ["decision_revisions", "decisions", "projects", "session_projects"];
-const EXPECTED_INDEXES = [
+const EXPECTED_TABLES_V1 = ["decision_revisions", "decisions", "projects", "session_projects"];
+const EXPECTED_INDEXES_V1 = [
   "idx_decision_revisions_decision_created",
   "idx_decisions_project_updated",
   "idx_projects_name",
   "idx_session_projects_project_id",
+  "uq_projects_project_key",
+  "uq_session_projects_session_id",
+];
+
+const EXPECTED_TABLES = ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"];
+const EXPECTED_INDEXES = [
+  "idx_decision_refs_reverse",
+  "idx_decision_revisions_decision_created",
+  "idx_decisions_project_updated",
+  "idx_projects_name",
+  "idx_session_projects_project_id",
+  "uq_decision_refs_edge",
+  "uq_decisions_external_id",
   "uq_projects_project_key",
   "uq_session_projects_session_id",
 ];
@@ -428,13 +871,17 @@ function assertForeignKeyIntegrity(database: DatabaseSync): void {
   }
 }
 
-function assertSchemaShape(database: DatabaseSync): void {
+function assertSchemaShape(
+  database: DatabaseSync,
+  expectedTables: readonly string[] = EXPECTED_TABLES,
+  expectedIndexes: readonly string[] = EXPECTED_INDEXES,
+): void {
   const tables = schemaTableNames(database);
-  if (tables.length !== EXPECTED_TABLES.length || EXPECTED_TABLES.some((name, index) => tables[index] !== name)) {
+  if (tables.length !== expectedTables.length || expectedTables.some((name, index) => tables[index] !== name)) {
     throw new Error("Database schema does not match the supported decision-store tables.");
   }
   const indexes = schemaIndexNames(database);
-  if (EXPECTED_INDEXES.some((name) => !indexes.includes(name))) {
+  if (expectedIndexes.some((name) => !indexes.includes(name))) {
     throw new Error("Database is missing one or more required decision-store indexes.");
   }
   assertForeignKeyIntegrity(database);
@@ -451,11 +898,32 @@ function preflightSchema(database: DatabaseSync): number {
     }
     return 0;
   }
+  if (version === 1) {
+    // A v1 database migrates to v2 on open. Refuse anything that is not exactly
+    // the v1 shape BEFORE touching it, so a foreign file is never ALTERed.
+    assertSchemaShape(database, EXPECTED_TABLES_V1, EXPECTED_INDEXES_V1);
+    return 1;
+  }
   if (version !== SCHEMA_VERSION) {
     throw new Error(`Unsupported database schema version ${version}.`);
   }
   assertSchemaShape(database);
   return version;
+}
+
+function migrateSchemaV1ToV2(database: DatabaseSync): void {
+  const strict = sqliteSupportsStrictTables(database);
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(MIGRATION_V1_TO_V2_SQL.replace("__REFS_TABLE__", decisionRefsTableSql(strict)));
+    assertForeignKeyIntegrity(database);
+    database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch { /* Preserve the original migration error. */ }
+    throw error;
+  }
+  database.exec("PRAGMA optimize");
 }
 
 function initializeSchema(database: DatabaseSync, version: number): void {
@@ -472,6 +940,8 @@ function initializeSchema(database: DatabaseSync, version: number): void {
       throw error;
     }
     database.exec("PRAGMA optimize");
+  } else if (version === 1) {
+    migrateSchemaV1ToV2(database);
   }
   assertSchemaShape(database);
 }
@@ -760,16 +1230,38 @@ export class SQLiteDecisionStore {
   createDecision(projectIdInput: unknown, input: unknown): DomainResult<DecisionCreateReceipt> {
     const projectId = parsePositiveSafeInteger(projectIdInput, "projectId");
     if (!projectId.ok) return projectId;
-    const parsed = parseDecisionCreateInput(input);
+    const split = parseCreateExtensions(input);
+    if (!split.ok) return split;
+    const parsed = parseDecisionCreateInput(split.data.base);
     if (!parsed.ok) return parserFailure(parsed);
+    const item = buildInsertItem(parsed.data, split.data);
     this.assertOpen();
     try {
-      return this.transaction(() => ({ ok: true, data: this.insertDecision(projectId.data, parsed.data) }));
+      return this.transaction(() => {
+        // External-id dedupe runs INSIDE the write transaction: BEGIN IMMEDIATE
+        // holds the writer lock from here to COMMIT, so no other connection can
+        // insert the same key between this lookup and the insert. Repeating a
+        // create (including after an interrupted batch run) returns the existing
+        // record instead of producing a second row (requirements §10.2).
+        if (item.externalId !== undefined) {
+          const existing = one<DecisionRow>(this.database,
+            decisionSelect("WHERE external_id = ?"),
+            [item.externalId],
+          );
+          if (existing !== undefined) {
+            return { ok: true, data: receiptForExisting(targetOfRow(existing), item.externalId) };
+          }
+        }
+        return { ok: true, data: this.insertDecision(projectId.data, item) };
+      });
     } catch (error) {
       if (isForeignKeyError(error)) return failure("PROJECT_REQUIRED", "Project is not available in this database.");
       const constraintField = decisionConstraintField(error);
       if (constraintField !== undefined) {
         return validationFailure(constraintField, "Value violates a persisted decision constraint.");
+      }
+      if (isExternalIdUniqueError(error)) {
+        return validationFailure("externalId", "External id already exists in this Profile database.");
       }
       return sqliteFailure(error);
     }
@@ -778,24 +1270,69 @@ export class SQLiteDecisionStore {
   createDecisionsBatch(projectIdInput: unknown, input: unknown): DomainResult<DecisionBatchReceipt> {
     const projectId = parsePositiveSafeInteger(projectIdInput, "projectId");
     if (!projectId.ok) return projectId;
-    const parsed = parseDecisionCreateBatchInput(input);
+    const batch = splitBatchInput(input);
+    if (!batch.ok) return batch;
+    const parsed = parseDecisionCreateBatchInput(batch.data.base);
     if (!parsed.ok) return parserFailure(parsed);
+    const items = parsed.data.decisions.map((item, index) => buildInsertItem(item, batch.data.items[index]!));
     this.assertOpen();
     try {
       return this.transaction(() => {
         // All rows were parsed before the transaction opened; a rejected row
         // therefore comes from a persisted CHECK, not from input validation.
-        const decisions = parsed.data.decisions.map((item, index) => {
+        //
+        // External-id dedupe covers BOTH a row that already exists (an earlier
+        // batch interrupted mid-run) and a row created earlier in THIS batch,
+        // so the idempotency key works within and across batches (requirements
+        // §10.2: create_batch's all-or-nothing rollback does not cover the gap
+        // between batches).
+        const targets = new Map<string, ExistingDecisionTarget>();
+        const keys = items.flatMap((item) => (item.externalId === undefined ? [] : [item.externalId]));
+        if (keys.length > 0) {
+          const placeholders = keys.map(() => "?").join(", ");
+          for (const row of many<DecisionRow>(this.database,
+            decisionSelect(`WHERE external_id IN (${placeholders})`),
+            keys,
+          )) targets.set(row.externalId!, targetOfRow(row));
+        }
+        const decisions: DecisionBatchReceipt["decisions"] = [];
+        let createdCount = 0;
+        for (let index = 0; index < items.length; index += 1) {
+          const item = items[index]!;
           try {
-            const receipt = this.insertDecision(projectId.data, item);
-            return { index: index + 1, decisionId: receipt.decisionId, revision: 1 as const };
+            let receipt: DecisionCreateReceipt;
+            const target = item.externalId === undefined ? undefined : targets.get(item.externalId);
+            if (target !== undefined) {
+              receipt = receiptForExisting(target, item.externalId!);
+            } else {
+              receipt = this.insertDecision(projectId.data, item);
+              createdCount += 1;
+              if (item.externalId !== undefined) {
+                targets.set(item.externalId, {
+                  decisionId: receipt.decisionId,
+                  revision: receipt.revision,
+                  summary: receipt.summary,
+                  status: receipt.status,
+                  createdAt: receipt.createdAt,
+                });
+              }
+            }
+            decisions.push({
+              index: index + 1,
+              decisionId: receipt.decisionId,
+              revision: receipt.revision,
+              ...(item.externalId === undefined ? {} : {
+                externalId: item.externalId,
+                alreadyExisted: receipt.alreadyExisted === true,
+              }),
+            });
           } catch (error) {
             const constraintField = decisionConstraintField(error);
             if (constraintField === undefined) throw error;
             throw new RowConstraintError(index + 1, constraintField);
           }
-        });
-        return { ok: true, data: { createdCount: decisions.length, decisions } };
+        }
+        return { ok: true, data: { createdCount, decisions } };
       });
     } catch (error) {
       if (error instanceof RowConstraintError) {
@@ -806,7 +1343,7 @@ export class SQLiteDecisionStore {
     }
   }
 
-  getDecision(projectIdInput: unknown, input: unknown): DomainResult<DecisionRecord> {
+  getDecision(projectIdInput: unknown, input: unknown): DomainResult<DecisionRecordView> {
     const projectId = parsePositiveSafeInteger(projectIdInput, "projectId");
     if (!projectId.ok) return projectId;
     const parsed = parseDecisionGetInput(input);
@@ -818,7 +1355,7 @@ export class SQLiteDecisionStore {
         [parsed.data.decisionId, projectId.data],
       );
       if (row === undefined) return failure("DECISION_NOT_FOUND", "Decision was not found.");
-      return { ok: true, data: toDecisionRecord(row) };
+      return { ok: true, data: toDecisionRecordView(row) };
     } catch (error) {
       return sqliteFailure(error);
     }
@@ -827,30 +1364,41 @@ export class SQLiteDecisionStore {
   searchDecisions(projectIdInput: unknown, input: unknown): DomainResult<DecisionSearchPage> {
     const projectId = parsePositiveSafeInteger(projectIdInput, "projectId");
     if (!projectId.ok) return projectId;
-    const parsed = parseDecisionSearchInput(input);
-    if (!parsed.ok) return parserFailure(parsed);
+    const parsed = parseSearchInput(input);
+    if (!parsed.ok) return parsed;
     this.assertOpen();
 
-    const pattern = escapeLikeLiteral(parsed.data.query);
-    const statusFilter = parsed.data.includeVoided ? "" : "AND status = 'effective'";
-    const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status
-      FROM decisions
-      WHERE project_id = ? ${statusFilter}
-        AND (decision_text LIKE ? ESCAPE '\\'
+    const { query, timeHorizon, includeVoided, limit, offset } = parsed.data;
+    const whereParts = ["project_id = ?"];
+    const values: BindValue[] = [projectId.data];
+    if (!includeVoided) whereParts.push("status = 'effective'");
+    if (timeHorizon !== undefined) {
+      whereParts.push("time_horizon = ?");
+      values.push(timeHorizon);
+    }
+    if (query !== undefined) {
+      const pattern = escapeLikeLiteral(query);
+      whereParts.push(`(decision_text LIKE ? ESCAPE '\\'
           OR summary LIKE ? ESCAPE '\\'
           OR rationale LIKE ? ESCAPE '\\'
-          OR source_reference LIKE ? ESCAPE '\\')
+          OR source_reference LIKE ? ESCAPE '\\')`);
+      values.push(pattern, pattern, pattern, pattern);
+    }
+    const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status, time_horizon AS timeHorizon
+      FROM decisions
+      WHERE ${whereParts.join(" AND ")}
       ORDER BY updated_at DESC, id DESC
       LIMIT ? OFFSET ?`;
+    values.push(limit + 1, offset);
 
     try {
-      const rows = many<{ decisionId: number; summary: string | null; decision: string; status: DecisionStatus }>(
+      const rows = many<{ decisionId: number; summary: string | null; decision: string; status: DecisionStatus; timeHorizon: TimeHorizon }>(
         this.database,
         sql,
-        [projectId.data, pattern, pattern, pattern, pattern, parsed.data.limit + 1, parsed.data.offset],
+        values,
       );
-      const hasMore = rows.length > parsed.data.limit;
-      const selected = hasMore ? rows.slice(0, parsed.data.limit) : rows;
+      const hasMore = rows.length > limit;
+      const selected = hasMore ? rows.slice(0, limit) : rows;
       return {
         ok: true,
         data: {
@@ -858,6 +1406,7 @@ export class SQLiteDecisionStore {
             decisionId: row.decisionId,
             preview: previewText(row.summary ?? row.decision),
             status: row.status,
+            timeHorizon: row.timeHorizon,
           })),
           hasMore,
         },
@@ -1076,7 +1625,7 @@ export class SQLiteDecisionStore {
     return new Date(nextMillis).toISOString();
   }
 
-  private insertDecision(projectId: number, input: DecisionCreateInput): DecisionCreateReceipt {
+  private insertDecision(projectId: number, input: DecisionInsertItem): DecisionCreateReceipt {
     const createdAt = nowIso();
     // The ordering tick is allocated separately from the display timestamp: a
     // create inside the same millisecond as a previous write must still sort after
@@ -1086,8 +1635,8 @@ export class SQLiteDecisionStore {
       `INSERT INTO decisions (
         project_id, decision_text, summary, rationale, time_horizon,
         decision_date, review_date, status, void_reason, voided_at,
-        source_reference, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'effective', NULL, NULL, ?, ?, ?)`,
+        source_reference, created_at, updated_at, external_id, replaces_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'effective', NULL, NULL, ?, ?, ?, ?, ?)`,
       [
         projectId,
         input.decision,
@@ -1099,14 +1648,27 @@ export class SQLiteDecisionStore {
         input.sourceReference ?? null,
         createdAt,
         updatedAt,
+        input.externalId ?? null,
+        input.replaces === undefined ? null : JSON.stringify(input.replaces),
       ],
     );
+    const decisionId = toSafeId(result.lastInsertRowid);
+    // Typed reference edges are part of the same write transaction; a decision
+    // and its refs commit together (requirements §10.3).
+    if (input.refs !== undefined && input.refs.length > 0) {
+      const insertRef = prepare(this.database,
+        "INSERT INTO decision_refs (decision_id, ref_type, ref_key, created_at) VALUES (?, ?, ?, ?)");
+      for (const ref of input.refs) insertRef.run(decisionId, ref.type, ref.id, createdAt);
+    }
     return {
-      decisionId: toSafeId(result.lastInsertRowid),
+      decisionId,
       revision: 1,
       summary: input.summary ?? null,
       status: "effective",
       createdAt,
+      // The extension markers appear only when the input carried externalId;
+      // without it the receipt keeps exactly the frozen five-field shape.
+      ...(input.externalId === undefined ? {} : { externalId: input.externalId, alreadyExisted: false }),
     };
   }
 
@@ -1153,11 +1715,20 @@ const DECISION_CONSTRAINT_FIELDS: Record<string, string> = {
   ck_decisions_decision_date: "decisionDate",
   ck_decisions_review_date: "reviewDate",
   ck_decisions_time_horizon: "timeHorizon",
+  ck_decisions_external_id: "externalId",
+  ck_decisions_replaces_json: "replaces",
+  ck_decision_refs_type: "refs",
+  ck_decision_refs_key: "refs",
 };
 
 function decisionConstraintField(error: unknown): string | undefined {
   const message = error instanceof Error ? error.message : String(error);
-  const match = /CHECK constraint failed: (ck_decisions_[a-z_]+)/iu.exec(message);
+  const match = /CHECK constraint failed: (ck_decisions?_[a-z_]+)/iu.exec(message);
   if (match === null) return undefined;
   return DECISION_CONSTRAINT_FIELDS[match[1]!.toLowerCase()];
+}
+
+function isExternalIdUniqueError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /UNIQUE constraint failed: decisions\\.external_id/i.test(message);
 }
