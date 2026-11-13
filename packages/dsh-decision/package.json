@@ -1,0 +1,39 @@
+{
+  "name": "@cc01cc/dsh-decision",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DSD domain module; candidate package name availability remains to be checked at M0.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    "./typert": {
+      "types": "./lib/typert.host.d.ts",
+      "default": "./lib/typert.host.js"
+    },
+    "./client/typert": {
+      "types": "./lib/typert.client.d.ts",
+      "default": "./lib/typert.client.js"
+    }
+  },
+  "files": [
+    "lib/typert.host.d.ts",
+    "lib/typert.host.js",
+    "lib/typert.client.d.ts",
+    "lib/typert.client.js"
+  ],
+  "scripts": {
+    "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-typert-generator": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "3.19.0",
+    "@types/node": "24.10.0",
+    "typescript": "6.0.3"
+  }
+}

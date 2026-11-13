@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "rootDir": "./src",
+    "outDir": "./.tsbuild/client",
+    "tsBuildInfoFile": "./.tsbuild/client.tsbuildinfo"
+  },
+  "include": [
+    "src/domain/**/*.ts"
+  ]
+}

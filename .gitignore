@@ -1,0 +1,6 @@
+# Local pnpm dependency installations
+/node_modules/
+/packages/dsh-decision/node_modules/
+
+# TypeScript project-reference build output
+/packages/dsh-decision/.tsbuild/

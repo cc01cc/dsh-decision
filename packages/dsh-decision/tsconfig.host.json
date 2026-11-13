@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "rootDir": "./src",
+    "outDir": "./.tsbuild/host",
+    "tsBuildInfoFile": "./.tsbuild/host.tsbuildinfo"
+  },
+  "include": [
+    "src/domain/**/*.ts",
+    "src/storage/**/*.ts"
+  ]
+}
