@@ -33,6 +33,12 @@ For this first version, evaluate bundling the official SQLite backend with `stor
 
 - Upstream: <https://github.com/cc01cc/dsh-decision>
 
+## Adapter boundary
+
+DSH is the primary form of this plugin. A thin CLI is a **second adapter on the same injection seam** (`DecisionToolDeps`), not a new permission boundary: adding it does not buy any access control, and its attribution degrades to OS-account level.
+
+Scope, the minimal call surface, what this project deliberately does **not** do, and how CLI and the DSH plugin divide work are frozen in [`docs/adapter-boundary.md`](docs/adapter-boundary.md). Read it before proposing any caller-identity, token, or permission-model work.
+
 ## Development status
 
 Repository initialized from the upstream LICENSE-only commit. Plugin UI and tool extension points are available in the installed Host; the SQLite backend packaging path and deletion/revision policy remain to be confirmed before implementation. No plugin has been installed into a DSH profile.
