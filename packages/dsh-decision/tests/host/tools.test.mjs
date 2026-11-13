@@ -1,0 +1,371 @@
+
+import assert from "node:assert/strict";
+import { after, test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { SQLiteDecisionStore } from "../../src/storage/sqlite-store.ts";
+import {
+  DECISION_TOOL_NAMES,
+  DecisionToolRefusal,
+  createDecisionTools,
+  registerDecisionTools,
+} from "../../src/host/tools.ts";
+
+/**
+ * Six Agent tools L0 (PLAN-0779 T2.1/T2.3).
+ *
+ * Two properties are asserted structurally rather than by inspection:
+ * - ONE outlet: every tool resolves its project through resolveSessionProject,
+ *   so none can hold a private binding path. A tool that bypassed the outlet
+ *   would not see the project question and could not name the project at all.
+ * - ONE refusal shape: the same caller cause yields identical fields from all
+ *   six tools (deepEqual), so a Client cannot read one tool as authorized and
+ *   another as refused.
+ */
+
+const tempRoots = new Set();
+after(() => {
+  for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
+  tempRoots.clear();
+});
+
+function storeFor(t) {
+  const root = mkdtempSync(join(tmpdir(), "dsh-decision-tools-"));
+  tempRoots.add(root);
+  const store = SQLiteDecisionStore.open({ databasePath: join(root, "decisions.sqlite") });
+  t.after(() => store.close());
+  return store;
+}
+
+function registryOf(rootAgents, childAgents = []) {
+  const byId = new Map();
+  for (const agent of [...rootAgents, ...childAgents]) byId.set(agent.id, agent);
+  return { get: (id) => byId.get(id), roots: () => rootAgents };
+}
+
+function liveAgent(id) {
+  return { id, session: { id } };
+}
+
+/** Execution context as the Host passes it (only agent is trusted). */
+function execFor(agent, name, args) {
+  return { callId: "call-1", name, arguments: args, agent, signal: undefined };
+}
+
+/** Askers that script the first-use project question. */
+function refusingAsker() {
+  return {
+    calls: [],
+    async ask() { return { kind: "cancelled", reason: "no answer" }; },
+    async askTimed() { return { kind: "pending", callId: "c" }; },
+  };
+}
+
+function chooserFor(label) {
+  const asker = {
+    calls: [],
+    async ask(_agent, prompt) {
+      asker.calls.push(prompt.id);
+      const option = prompt.options.find((entry) => entry.label === label) ?? prompt.options[0];
+      return { kind: "answered", reply: { selected: option === undefined ? [] : [option.label] } };
+    },
+    async askTimed(_agent, prompt) { return asker.ask(_agent, prompt); },
+  };
+  return asker;
+}
+
+/** Valid arguments for each tool, unused fields irrelevant to the property under test. */
+function argsFor(name) {
+  if (name === "decision_search") return { query: "x" };
+  if (name === "decision_get") return { decisionId: 1 };
+  if (name === "decision_create") return { decision: "d" };
+  if (name === "decision_create_batch") return { decisions: [{ decision: "d" }] };
+  if (name === "decision_update") return { decisionId: 1, expectedRevision: 1, patch: { rationale: "r" } };
+  return { decisionId: 1, expectedRevision: 1, reason: "r" };
+}
+
+/** Invoke a tool and normalize either a result or a refusal into one record. */
+async function invoke(tool, agent, args) {
+  try {
+    const value = await tool.execute(args, execFor(agent, tool.name, args));
+    return { threw: false, value };
+  } catch (error) {
+    if (error instanceof DecisionToolRefusal) {
+      return { threw: true, reason: error.reason, message: error.message, name: error.name };
+    }
+    return { threw: true, reason: "<other:" + error.name + ">", message: error.message, name: error.name };
+  }
+}
+
+// ------------------------------------------------------- T2.1 registration
+
+test("T2.1: the six tools register in contract order with distinct names", () => {
+  const registered = [];
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  registerDecisionTools({ register: (definition) => registered.push(definition.name) }, deps);
+  // Contract order: lines 110, 145, 179, 212, 258, 292.
+  assert.deepEqual(registered, [
+    "decision_search",
+    "decision_get",
+    "decision_create",
+    "decision_create_batch",
+    "decision_update",
+    "decision_void",
+  ]);
+  assert.deepEqual(registered, [...DECISION_TOOL_NAMES]);
+});
+
+test("T2.1: no tool name collides with a built-in DSH tool name", () => {
+  // A duplicate registration name fails hard in the Host, so this set is the
+  // built-ins this composition actually ships (verified against the installed
+  // @deepseek-ai/* tool packages).
+  const BUILT_IN = new Set([
+    "bash", "read", "write", "edit", "apply_patch", "read_image", "glob", "grep",
+    "todo_write", "present", "skill", "ask_user_question", "web_search", "web_fetch",
+    "pwsh", "terminal_open", "terminal_send", "terminal_read", "terminal_signal",
+    "terminal_close", "terminal_list", "job_output", "job_list", "job_kill",
+    "schedule_create", "schedule_list", "schedule_view", "schedule_edit",
+    "session_search", "session_event_search", "session_trace", "session_event_trace",
+    "session_event_read", "working_directory", "load_workspace_dependencies",
+    "create_goal", "get_goal", "update_goal", "ralph", "create_worktree",
+    "subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent",
+    "wait_agent", "team_task_create", "team_task_list", "team_task_get", "team_task_update",
+    "list_subagent_models", "run_code", "str_replace_editor", "cordis_inspect_list",
+    "cordis_inspect_query",
+  ]);
+  for (const name of DECISION_TOOL_NAMES) {
+    assert.equal(BUILT_IN.has(name), false, name + " collides with a built-in tool");
+  }
+});
+
+test("T2.1: each tool's description states its own intent boundary", () => {
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  const byName = new Map(createDecisionTools(deps).map((tool) => [tool.name, tool]));
+  // Contract line 88: the write tools' descriptions carry the intent trust boundary.
+  for (const name of ["decision_create", "decision_create_batch", "decision_update", "decision_void"]) {
+    assert.match(byName.get(name).description, /explicitly ask/i, name);
+  }
+  // Contract lines 260, 294: read first, pass the revision unchanged, never replay.
+  for (const name of ["decision_update", "decision_void"]) {
+    assert.match(byName.get(name).description, /decision_get/i, name);
+    assert.match(byName.get(name).description, /expectedRevision/i, name);
+    assert.match(byName.get(name).description, /REVISION_CONFLICT/i, name);
+  }
+  // Contract line 112: search points at decision_get for full content.
+  assert.match(byName.get("decision_search").description, /decision_get/i);
+  // Contract lines 149, 296: get is readable even when voided; void needs a reason.
+  assert.match(byName.get("decision_get").description, /voided/i);
+  assert.match(byName.get("decision_void").description, /reason/i);
+});
+
+// --------------------------------------------------- T2.3 single outlet
+
+test("T2.3: an unbound session is asked once and all six tools then share the project", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  const asker = chooserFor("Atlas · atlas");
+  const deps = { agents: registryOf([root]), openStore: () => store, asker };
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+
+  const search = createDecisionTools(deps).find((tool) => tool.name === "decision_search");
+  const first = await search.execute({ query: "anything" }, execFor(root, "decision_search", { query: "anything" }));
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(asker.calls.length, 1, "the first call asks the project question exactly once");
+
+  const created = store.createDecision(1, { decision: "Use SQLite." });
+  assert.equal(created.ok, true, JSON.stringify(created));
+  const id = created.data.decisionId;
+
+  // Each tool is exercised against the revision that exists when it runs, exactly
+  // as the contract instructs the model to do (lines 260, 294).
+  for (const tool of createDecisionTools(deps)) {
+    if (tool.name === "decision_search") continue;
+    if (tool.name === "decision_get") {
+      const outcome = await invoke(tool, root, { decisionId: id });
+      assert.equal(outcome.value.ok, true, "decision_get: " + JSON.stringify(outcome.value));
+      continue;
+    }
+    if (tool.name === "decision_create") {
+      const outcome = await invoke(tool, root, { decision: "Another decision." });
+      assert.equal(outcome.value.ok, true, "decision_create: " + JSON.stringify(outcome.value));
+      continue;
+    }
+    if (tool.name === "decision_create_batch") {
+      const outcome = await invoke(tool, root, { decisions: [{ decision: "Batch decision." }] });
+      assert.equal(outcome.value.ok, true, "decision_create_batch: " + JSON.stringify(outcome.value));
+      continue;
+    }
+    // update then void: read the current revision first, as the tools instruct.
+    const current = store.getDecision(1, { decisionId: id });
+    assert.equal(current.ok, true, JSON.stringify(current));
+    const args = tool.name === "decision_update"
+      ? { decisionId: id, expectedRevision: current.data.revision, patch: { rationale: "Because." } }
+      : { decisionId: id, expectedRevision: current.data.revision, reason: "Superseded." };
+    const outcome = await invoke(tool, root, args);
+    assert.equal(outcome.value.ok, true, tool.name + ": " + JSON.stringify(outcome.value));
+  }
+  assert.equal(asker.calls.length, 1, "no tool re-asks once the session is bound");
+});
+
+test("T2.3: no tool invents a project when the outlet yields none", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  // A project exists, so skipping the outlet would silently produce a decision write;
+  // the refusing asker proves the outlet is the only path.
+  const deps = { agents: registryOf([root]), openStore: () => store, asker: refusingAsker() };
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+
+  for (const tool of createDecisionTools(deps)) {
+    const outcome = await invoke(tool, root, argsFor(tool.name));
+    assert.equal(outcome.threw, false, tool.name);
+    assert.equal(outcome.value.ok, false, tool.name + " must not invent a project");
+    assert.equal(outcome.value.error.code, "PROJECT_REQUIRED", tool.name);
+  }
+  assert.equal(store.getBoundProject("session-root").data, null, "nothing was bound");
+  assert.equal(store.listProjects().data.length, 1, "no project was created");
+});
+
+test("T2.3: another project's decision is indistinguishable from a missing one", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  const asker = chooserFor("Atlas · atlas");
+  const deps = { agents: registryOf([root]), openStore: () => store, asker };
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+  const other = store.createProject({ name: "Borealis", projectKey: "borealis" });
+  const foreign = store.createDecision(other.data.projectId, { decision: "Belongs to Borealis." });
+  assert.equal(foreign.ok, true, JSON.stringify(foreign));
+
+  const getTool = createDecisionTools(deps).find((tool) => tool.name === "decision_get");
+  // Bind to Borealis so the "foreign" decision is in scope, then switch to Atlas:
+  // the same id must then read as absent.
+  store.bindSession("session-root", other.data.projectId);
+  const inScope = await invoke(getTool, root, { decisionId: foreign.data.decisionId });
+  assert.equal(inScope.value.ok, true, JSON.stringify(inScope.value));
+
+  // A different session bound to Atlas cannot see Borealis's decision.
+  const atlasRoot = liveAgent("session-atlas");
+  store.bindSession("session-atlas", store.getProjectByKey("atlas").data.projectId);
+  const atlasDeps = { agents: registryOf([root, atlasRoot]), openStore: () => store, asker: refusingAsker() };
+  const atlasGet = createDecisionTools(atlasDeps).find((tool) => tool.name === "decision_get");
+  const foreignResult = await invoke(atlasGet, atlasRoot, { decisionId: foreign.data.decisionId });
+  const missingResult = await invoke(atlasGet, atlasRoot, { decisionId: 999 });
+
+  assert.equal(foreignResult.value.ok, false);
+  assert.equal(missingResult.value.ok, false);
+  assert.equal(foreignResult.value.error.code, "DECISION_NOT_FOUND");
+  assert.equal(missingResult.value.error.code, "DECISION_NOT_FOUND");
+
+  // Pinned against the store's own failure, not just against each other:
+  // comparing two tool results would pass even if BOTH leaked the project name.
+  const canonical = store.getDecision(store.getProjectByKey("atlas").data.projectId, { decisionId: 999 });
+  assert.equal(canonical.ok, false, JSON.stringify(canonical));
+  assert.deepEqual(foreignResult.value.error, canonical.error, "a foreign decision must read exactly like a missing one");
+  assert.deepEqual(missingResult.value.error, canonical.error, "a missing decision must read exactly like the domain failure");
+  // No ownership field may appear at all (contract line 350).
+  assert.deepEqual(Object.keys(foreignResult.value.error).sort(), ["code", "message"]);
+  assert.equal(foreignResult.value.error.message.includes("Borealis"), false, "the message must not name the owning project");
+  assert.equal(foreignResult.value.error.message.includes("Atlas"), false, "the message must not name the current project");
+});
+
+// ------------------------------------------- cross-tool refusal consistency
+
+test("T2.3: all six tools refuse the same caller cause with identical fields", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  const child = liveAgent("session-child");
+  const impostor = liveAgent("session-root");
+  const scenarios = [
+    ["missing caller", undefined, registryOf([root]), "CALLER_REQUIRED"],
+    ["impostor", impostor, registryOf([root]), "CALLER_NOT_LIVE"],
+    ["delegated", child, registryOf([root], [child]), "DELEGATED_CALLER"],
+  ];
+
+  for (const [label, agent, registry, reason] of scenarios) {
+    const deps = { agents: registry, openStore: () => store, asker: refusingAsker() };
+    const payloads = [];
+    for (const tool of createDecisionTools(deps)) {
+      payloads.push({ tool: tool.name, ...(await invoke(tool, agent, argsFor(tool.name))) });
+    }
+    const refusals = payloads.filter((payload) => payload.threw === true);
+    assert.equal(refusals.length, DECISION_TOOL_NAMES.length, label + ": all six must refuse");
+    assert.equal(refusals[0].reason, reason, label);
+    for (const payload of refusals) {
+      assert.deepEqual(
+        { reason: payload.reason, message: payload.message, name: payload.name },
+        { reason: refusals[0].reason, message: refusals[0].message, name: refusals[0].name },
+        label + "/" + payload.tool,
+      );
+    }
+  }
+});
+
+test("T2.3: a refused caller never opens the store or asks a question", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  let opened = 0;
+  const asker = refusingAsker();
+  const deps = { agents: registryOf([root]), openStore: () => { opened += 1; return store; }, asker };
+  for (const tool of createDecisionTools(deps)) {
+    const outcome = await invoke(tool, undefined, argsFor(tool.name));
+    assert.equal(outcome.threw, true, tool.name);
+  }
+  assert.equal(opened, 0, "no store was opened for a refused caller");
+  assert.deepEqual(asker.calls, [], "no question was asked for a refused caller");
+});
+
+// -------------------------------------- write tools: >=2 negatives each
+
+test("T2.1: each write tool refuses a missing project and a stale revision without side effects", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  const asker = chooserFor("Atlas · atlas");
+  const deps = { agents: registryOf([root]), openStore: () => store, asker };
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+  const tools = new Map(createDecisionTools(deps).map((tool) => [tool.name, tool]));
+  // Bind once through the outlet so the negatives below fail for their own reason,
+  // not because the session was unbound.
+  await tools.get("decision_search").execute({ query: "x" }, execFor(root, "decision_search", { query: "x" }));
+  const seed = store.createDecision(1, { decision: "Seed decision." });
+  assert.equal(seed.ok, true, JSON.stringify(seed));
+  const id = seed.data.decisionId;
+
+  // Negative 1: no bound project — a session whose binding is absent must be asked,
+  // and when the asker refuses the write tool reports PROJECT_REQUIRED and writes nothing.
+  const unbound = liveAgent("session-unbound");
+  const refusing = refusingAsker();
+  const unboundDeps = { agents: registryOf([root, unbound]), openStore: () => store, asker: refusing };
+  const unboundTools = new Map(createDecisionTools(unboundDeps).map((tool) => [tool.name, tool]));
+  const before = store.searchDecisions(1, { query: "" });
+  for (const name of ["decision_create", "decision_create_batch", "decision_update", "decision_void"]) {
+    const outcome = await invoke(unboundTools.get(name), unbound, argsFor(name));
+    assert.equal(outcome.value.ok, false, name);
+    assert.equal(outcome.value.error.code, "PROJECT_REQUIRED", name + " must refuse without a project");
+  }
+  assert.equal(store.getBoundProject("session-unbound").data, null, "no binding was written");
+  assert.deepEqual(store.searchDecisions(1, { query: "" }), before, "no decision was written");
+
+  // Negative 2: stale expectedRevision — refused with no snapshot and no revision bump.
+  const current = store.getDecision(1, { decisionId: id });
+  const stale = current.data.revision + 7;
+  const updateStale = await invoke(tools.get("decision_update"), root, { decisionId: id, expectedRevision: stale, patch: { rationale: "stale" } });
+  assert.equal(updateStale.value.ok, false);
+  assert.equal(updateStale.value.error.code, "REVISION_CONFLICT");
+  const voidStale = await invoke(tools.get("decision_void"), root, { decisionId: id, expectedRevision: stale, reason: "stale" });
+  assert.equal(voidStale.value.ok, false);
+  assert.equal(voidStale.value.error.code, "REVISION_CONFLICT");
+  // Both refusals left the record exactly as it was.
+  const after = store.getDecision(1, { decisionId: id });
+  assert.equal(after.data.revision, current.data.revision);
+  assert.equal(after.data.status, current.data.status);
+  assert.deepEqual(store.getDecisionHistory(1, id).data, [], "no snapshot was appended by either refusal");
+
+  // Negative 3: a decision that does not exist — same code/shape as a foreign one.
+  for (const name of ["decision_update", "decision_void"]) {
+    const outcome = await invoke(tools.get(name), root, name === "decision_update"
+      ? { decisionId: 999, expectedRevision: 1, patch: { rationale: "r" } }
+      : { decisionId: 999, expectedRevision: 1, reason: "r" });
+    assert.equal(outcome.value.ok, false, name);
+    assert.equal(outcome.value.error.code, "DECISION_NOT_FOUND", name);
+  }
+});

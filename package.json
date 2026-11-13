@@ -6,6 +6,6 @@
     "node": ">=24"
   },
   "scripts": {
-    "test": "node --test packages/dsh-decision/tests/domain/decision-contract.test.mjs packages/dsh-decision/tests/storage/sqlite-store.test.mjs packages/dsh-decision/tests/storage/decision-ops.test.mjs packages/dsh-decision/tests/host/config.test.mjs packages/dsh-decision/tests/host/caller.test.mjs packages/dsh-decision/tests/host/binding.test.mjs packages/dsh-decision/tests/host/first-binding.test.mjs"
+    "test": "node --test packages/dsh-decision/tests/domain/decision-contract.test.mjs packages/dsh-decision/tests/storage/sqlite-store.test.mjs packages/dsh-decision/tests/storage/decision-ops.test.mjs packages/dsh-decision/tests/host/config.test.mjs packages/dsh-decision/tests/host/caller.test.mjs packages/dsh-decision/tests/host/binding.test.mjs packages/dsh-decision/tests/host/first-binding.test.mjs packages/dsh-decision/tests/host/tools.test.mjs"
   }
 }
