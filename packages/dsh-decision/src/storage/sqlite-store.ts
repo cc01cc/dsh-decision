@@ -544,15 +544,16 @@ function isProjectKeyUniqueError(error: unknown): boolean {
   return /UNIQUE constraint failed: projects\.project_key/i.test(message);
 }
 
+/**
+ * Wall-clock ISO timestamp (millisecond precision).
+ *
+ * Used for values that are only displayed, never ordered on: `created_at` of a
+ * project, a session binding, or a decision.
+ */
 function nowIso(): string {
   return new Date().toISOString();
 }
 
-function nextIsoAfter(previous: string): string {
-  const current = Date.now();
-  const previousMillis = Date.parse(previous);
-  return new Date(Number.isFinite(previousMillis) ? Math.max(current, previousMillis + 1) : current).toISOString();
-}
 
 function escapeLikeLiteral(value: string): string {
   return `%${value.replace(/[\\%_]/gu, "\\$&")}%`;
@@ -935,7 +936,7 @@ export class SQLiteDecisionStore {
           };
         }
 
-        const updatedAt = nextIsoAfter(current.updatedAt);
+        const updatedAt = this.nextUpdatedAt(projectId.data);
         this.insertSnapshot(current, "update", updatedAt);
         const columnFor: Record<string, string> = {
           decision: "decision_text",
@@ -1001,7 +1002,7 @@ export class SQLiteDecisionStore {
           };
         }
 
-        const voidedAt = nextIsoAfter(current.updatedAt);
+        const voidedAt = this.nextUpdatedAt(projectId.data);
         this.insertSnapshot(current, "void", voidedAt);
         const update = run(this.database,
           `UPDATE decisions
@@ -1045,8 +1046,42 @@ export class SQLiteDecisionStore {
     }
   }
 
+  /**
+   * Allocate the next `updated_at` for this project, strictly increasing.
+   *
+   * Why not the wall clock alone: the contract sorts search results by
+   * `updatedAt` then `decisionId`, both descending (contract line 114). Two writes
+   * inside the same millisecond would share a timestamp and the tie-break would
+   * collapse to id order, which is NOT the update order — the sort would silently
+   * stop reflecting recency. Ticks are a display value; the ordering guarantee must
+   * come from the store.
+   *
+   * The allocator reads the project's current maximum and returns
+   * `max(now, maximum + 1ms)`. Because every decision write inside one project goes
+   * through this single statement under `BEGIN IMMEDIATE`, the result is a total
+   * order over that project's decisions without a new column, a second sequence
+   * table, or a schema migration.
+   *
+   * Projects are independent: two projects may legitimately share a timestamp,
+   * because search never spans projects.
+   */
+  private nextUpdatedAt(projectId: number): string {
+    const maximum = one<{ latest: string | null }>(this.database,
+      "SELECT max(updated_at) AS latest FROM decisions WHERE project_id = ?",
+      [projectId],
+    )?.latest ?? null;
+    const latestMillis = maximum === null ? Number.NaN : Date.parse(maximum);
+    const nowMillis = Date.now();
+    const nextMillis = Number.isFinite(latestMillis) ? Math.max(nowMillis, latestMillis + 1) : nowMillis;
+    return new Date(nextMillis).toISOString();
+  }
+
   private insertDecision(projectId: number, input: DecisionCreateInput): DecisionCreateReceipt {
     const createdAt = nowIso();
+    // The ordering tick is allocated separately from the display timestamp: a
+    // create inside the same millisecond as a previous write must still sort after
+    // it (see nextUpdatedAt).
+    const updatedAt = this.nextUpdatedAt(projectId);
     const result = run(this.database,
       `INSERT INTO decisions (
         project_id, decision_text, summary, rationale, time_horizon,
@@ -1063,7 +1098,7 @@ export class SQLiteDecisionStore {
         input.reviewDate ?? null,
         input.sourceReference ?? null,
         createdAt,
-        createdAt,
+        updatedAt,
       ],
     );
     return {
