@@ -144,6 +144,18 @@ test("initializes four tables, named indexes, user_version, and required connect
     "SELECT sql FROM sqlite_master WHERE type = 'table'",
     (statement) => statement.all().map((row) => row.sql).join("\\n"),
   );
+  // STRICT is used when the runtime supports it (SQLite >= 3.37); the runtime
+  // version is probed at open time, not assumed.
+  const sqliteVersion = String(withStatement(database,
+    "SELECT sqlite_version() AS version",
+    (statement) => statement.get().version,
+  ));
+  const strictSupported = Number(sqliteVersion.split(".")[0]) > 3
+    || (Number(sqliteVersion.split(".")[0]) === 3 && Number(sqliteVersion.split(".")[1]) >= 37);
+  assert.equal(strictSupported, true, `unexpected SQLite version ${sqliteVersion}`);
+  for (const table of ["projects", "session_projects", "decisions", "decision_revisions"]) {
+    assert.match(schemaSql, new RegExp(`CREATE TABLE \\b${table}\\b ([\\s\\S]*?)\\)\\s*STRICT`, "i"));
+  }
   for (const constraint of [
     "ck_projects_key",
     "ck_projects_name",
@@ -187,6 +199,45 @@ test("database checks enforce project key/name and decision text/date constraint
   assert.throws(() => insertRawDecision(database, project.projectId, { decisionDate: "2023-02-29" }), /CHECK constraint failed/i);
   assert.throws(() => insertRawDecision(database, project.projectId, { decisionDate: "2024-02-30" }), /CHECK constraint failed/i);
   assert.equal(createDecision(store, project.projectId, "😀".repeat(20_000)).revision, 1);
+});
+
+test("decision text length checks count original code points, not trimmed length", (t) => {
+  const { store } = storeFor(t);
+  const database = store.database;
+  const project = createProject(store);
+
+  // Padded original text is stored verbatim and stays within the raw limit.
+  const padded = createDecision(store, project.projectId, "  padded decision text  ");
+  const stored = dataOf(store.getDecision(project.projectId, { decisionId: padded.decisionId }));
+  assert.equal(stored.decision, "  padded decision text  ");
+
+  // A raw 20,008-code-point value whose trimmed length is 19,998 used to pass
+  // a trim-based CHECK; the frozen contract counts original code points.
+  const paddedOverLimit = " ".repeat(5) + "a".repeat(19_998) + " ".repeat(5);
+  assert.equal(Array.from(paddedOverLimit).length, 20_008);
+  assert.throws(() => insertRawDecision(database, project.projectId, { decision: paddedOverLimit }), /CHECK constraint failed/i);
+
+  // Exactly 20,000 original code points with interior whitespace is accepted.
+  const atLimit = ("a ".repeat(10_000)).slice(0, 20_000);
+  assert.equal(Array.from(atLimit).length, 20_000);
+  insertRawDecision(database, project.projectId, { decision: atLimit });
+
+  // summary: 302 original code points, trimmed 300 — rejected.
+  const summaryOverLimit = " ".repeat(1) + "s".repeat(300) + " ".repeat(1);
+  assert.throws(() => insertRawDecision(database, project.projectId, { decision: "ok", summary: summaryOverLimit }), /CHECK constraint failed/i);
+  // source_reference: 4,002 original code points, trimmed 4,000 — rejected.
+  const sourceOverLimit = " ".repeat(1) + "r".repeat(4_000) + " ".repeat(1);
+  assert.throws(() => insertRawDecision(database, project.projectId, { decision: "ok", sourceReference: sourceOverLimit }), /CHECK constraint failed/i);
+
+  // void_reason: 1,002 original code points, trimmed 1,000 — rejected on a raw voided row.
+  const reasonOverLimit = " ".repeat(1) + "v".repeat(1_000) + " ".repeat(1);
+  assert.throws(() => withStatement(database,
+    `INSERT INTO decisions (
+      project_id, decision_text, summary, rationale, time_horizon, decision_date,
+      review_date, status, void_reason, voided_at, source_reference, created_at, updated_at
+    ) VALUES (?, 'ok', NULL, NULL, 'temporary', NULL, NULL, 'voided', ?, ?, NULL, ?, ?)`,
+    (statement) => statement.run(project.projectId, reasonOverLimit, "2026-11-13T00:00:00.000Z", "2026-11-13T00:00:00.000Z", "2026-11-13T00:00:00.000Z"),
+  ), /CHECK constraint failed/i);
 });
 
 test("foreign keys reject missing parents and database-local keys repeat across databases", (t) => {

@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { isAbsolute } from "node:path";
+import { isAbsolute, parse } from "node:path";
 import {
   parseDecisionCreateBatchInput,
   parseDecisionCreateInput,
@@ -273,8 +273,12 @@ function checkNoControls(column: string): string {
 }
 
 function checkText(column: string, min: number, max: number): string {
+  // The frozen contract counts stored text in Unicode code points (SQLite
+  // length() on TEXT); trimming is only the non-blank test, so leading or
+  // trailing White_Space must not consume the length budget.
   return `(${column} IS NULL OR (
-    length(trim(${column}, ${UNICODE_WHITE_SPACE_SQL})) BETWEEN ${min} AND ${max}
+    length(${column}) BETWEEN ${min} AND ${max}
+    AND length(trim(${column}, ${UNICODE_WHITE_SPACE_SQL})) > 0
     AND ${checkNoNul(column)}
   ))`;
 }
@@ -307,7 +311,7 @@ CREATE TABLE projects (
   ),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
-);
+)__STRICT__;
 
 CREATE UNIQUE INDEX uq_projects_project_key ON projects(project_key);
 CREATE INDEX idx_projects_name ON projects(name);
@@ -321,7 +325,7 @@ CREATE TABLE session_projects (
   updated_at TEXT NOT NULL,
   CONSTRAINT fk_session_projects_project_id
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
-);
+)__STRICT__;
 CREATE UNIQUE INDEX uq_session_projects_session_id ON session_projects(session_id);
 CREATE INDEX idx_session_projects_project_id ON session_projects(project_id);
 
@@ -330,7 +334,8 @@ CREATE TABLE decisions (
   revision INTEGER NOT NULL DEFAULT 1 CONSTRAINT ck_decisions_revision CHECK (revision > 0),
   project_id INTEGER NOT NULL,
   decision_text TEXT NOT NULL CONSTRAINT ck_decisions_text CHECK (
-    length(trim(decision_text, ${UNICODE_WHITE_SPACE_SQL})) BETWEEN 1 AND 20000
+    length(decision_text) BETWEEN 1 AND 20000
+    AND length(trim(decision_text, ${UNICODE_WHITE_SPACE_SQL})) > 0
     AND ${checkNoNul("decision_text")}
   ),
   summary TEXT CONSTRAINT ck_decisions_summary CHECK (${checkText("summary", 1, 300)}),
@@ -350,13 +355,14 @@ CREATE TABLE decisions (
     (status = 'effective' AND void_reason IS NULL AND voided_at IS NULL)
     OR
     (status = 'voided' AND void_reason IS NOT NULL
-      AND length(trim(void_reason, ${UNICODE_WHITE_SPACE_SQL})) BETWEEN 1 AND 1000
+      AND length(void_reason) BETWEEN 1 AND 1000
+      AND length(trim(void_reason, ${UNICODE_WHITE_SPACE_SQL})) > 0
       AND ${checkNoNul("void_reason")}
       AND voided_at IS NOT NULL)
   ),
   CONSTRAINT fk_decisions_project_id
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT
-);
+)__STRICT__;
 CREATE INDEX idx_decisions_project_updated ON decisions(project_id, updated_at DESC, id DESC);
 
 CREATE TABLE decision_revisions (
@@ -369,10 +375,25 @@ CREATE TABLE decision_revisions (
   created_at TEXT NOT NULL,
   CONSTRAINT fk_decision_revisions_decision_id
     FOREIGN KEY (decision_id) REFERENCES decisions(id) ON DELETE RESTRICT
-);
+)__STRICT__;
 CREATE INDEX idx_decision_revisions_decision_created
   ON decision_revisions(decision_id, created_at DESC, id DESC);
 `;
+
+// SQLite 3.37+ parses the STRICT table suffix; older libraries must keep the
+// plain schema. The runtime is probed instead of assumed.
+function sqliteSupportsStrictTables(database: DatabaseSync): boolean {
+  const version = String(scalar<string>(database, "SELECT sqlite_version() AS version"));
+  const match = /^(\d+)\.(\d+)/u.exec(version);
+  if (match === null) throw new Error("Could not determine the SQLite library version.");
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && minor >= 37);
+}
+
+function schemaSql(strict: boolean): string {
+  return SCHEMA_SQL.replaceAll("__STRICT__", strict ? "STRICT" : "");
+}
 
 function schemaTableNames(database: DatabaseSync): string[] {
   return many<{ name: string }>(database,
@@ -438,9 +459,10 @@ function preflightSchema(database: DatabaseSync): number {
 
 function initializeSchema(database: DatabaseSync, version: number): void {
   if (version === 0) {
+    const strict = sqliteSupportsStrictTables(database);
     database.exec("BEGIN IMMEDIATE");
     try {
-      database.exec(SCHEMA_SQL);
+      database.exec(schemaSql(strict));
       assertForeignKeyIntegrity(database);
       database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       database.exec("COMMIT");
@@ -453,14 +475,25 @@ function initializeSchema(database: DatabaseSync, version: number): void {
   assertSchemaShape(database);
 }
 
-function openDatabase(databasePath: string): DatabaseSync {
-  if (typeof databasePath !== "string" || databasePath.trim().length === 0 || !isAbsolute(databasePath)) {
+/**
+ * Fail-closed Config gate shared by the store and the Host Config resolver.
+ * Never falls back to $DSH_HOME, process.cwd(), or any shared root, and never
+ * creates parent directories.
+ */
+export function validateDatabasePath(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0 || !isAbsolute(value)) {
     throw new TypeError("An explicit absolute databasePath is required; Profile path resolution is not provided by this store.");
   }
-  if (databasePath === ":memory:") {
+  if (process.platform === "win32" && parse(value).root.length <= 1) {
+    throw new TypeError("An explicit absolute databasePath is required; a drive-less rooted path would resolve against process.cwd().");
+  }
+  if (value === ":memory:") {
     throw new TypeError("This store requires an explicit file path; in-memory databases are not a Profile store.");
   }
+  return value;
+}
 
+function openDatabase(databasePath: string): DatabaseSync {
   const database = new DatabaseSync(databasePath);
   try {
     database.exec("PRAGMA busy_timeout = 5000");
@@ -553,10 +586,7 @@ export class SQLiteDecisionStore {
     if (typeof options !== "object" || options === null || Array.isArray(options)) {
       throw new TypeError("Store options must be an object containing databasePath.");
     }
-    const databasePath = (options as Record<string, unknown>).databasePath;
-    if (typeof databasePath !== "string") {
-      throw new TypeError("An explicit databasePath is required; no Profile or shared-root fallback is available.");
-    }
+    const databasePath = validateDatabasePath((options as Record<string, unknown>).databasePath);
     const database = openDatabase(databasePath);
     return new SQLiteDecisionStore(databasePath, database);
   }
