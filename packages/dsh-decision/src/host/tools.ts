@@ -591,10 +591,25 @@ export function createDecisionTools(deps: DecisionToolDeps): ToolDefinition[] {
   ];
 }
 
+/**
+ * Compiles one author-spec definition into the registry-ready form.
+ *
+ * The Host MUST pass `defineTool` from the host-provided `@deepseek-ai/dsh-tools`
+ * (peer dependency; the version published on npm is not the host's version, so
+ * this package never imports it statically). The parameter is REQUIRED on
+ * purpose: registering the author-spec definitions raw is rejected by the real
+ * registry (`assertSupportedJsonSchema` on output.schema) and would also skip
+ * executor-level argument and output validation. Making the compiler mandatory
+ * turns "forgot to compile" into a type error instead of a silent regression
+ * (task-388 / D-1238; witnessed by tests/executor/executor-matrix.test.mjs).
+ */
+export type ToolCompiler = (definition: ToolDefinition) => unknown;
+
 /** Register all six tools on a registry-shaped sink (the Host's ctx.tools). */
 export function registerDecisionTools(
   sink: { register(definition: unknown): unknown },
   deps: DecisionToolDeps,
+  compile: ToolCompiler,
 ): void {
-  for (const tool of createDecisionTools(deps)) sink.register(tool);
+  for (const tool of createDecisionTools(deps)) sink.register(compile(tool));
 }

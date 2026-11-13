@@ -24,9 +24,11 @@
     "lib/typert.client.js"
   ],
   "scripts": {
-    "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/storage/timestamp-order.test.mjs tests/host/config.test.mjs tests/host/caller.test.mjs tests/host/binding.test.mjs tests/host/first-binding.test.mjs tests/host/tools.test.mjs"
+    "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/storage/timestamp-order.test.mjs tests/host/config.test.mjs tests/host/caller.test.mjs tests/host/binding.test.mjs tests/host/first-binding.test.mjs tests/host/tools.test.mjs",
+    "test:executor": "node --test tests/executor/executor-matrix.test.mjs"
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
     "@deepseek-ai/schemastery": "~3.19.0"
   },
   "devDependencies": {
@@ -35,5 +37,10 @@
     "@deepseek-ai/schemastery": "3.19.0",
     "@types/node": "24.10.0",
     "typescript": "6.0.3"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
   }
 }
