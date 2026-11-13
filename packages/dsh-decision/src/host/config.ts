@@ -4,6 +4,7 @@ import { existsSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SQLiteDecisionStore, validateDatabasePath } from "../storage/sqlite-store.ts";
+import type { DecisionHostSurfaces } from "./register.ts";
 
 /**
  * Host Config contract for the DSD plugin.
@@ -97,12 +98,27 @@ export function getDecisionStore(ctx: Context): SQLiteDecisionStore {
 }
 
 /**
+ * Host services the plugin waits for before cordis runs apply.
+ *
+ * Names verified against the installed Host runtime (0.2.2-rc.1):
+ * ToolsService provides "tools"; AgentRegistry calls super(ctx, "agents")
+ * (dsh-agent lib/index.js:450); UserQuestionService calls
+ * super(ctx, "userQuestions") (dsh-user-questions lib/index.js:492).
+ * Declaring them here is what makes the registration timing safe: cordis
+ * defers apply until all three exist, so apply never sees a half-ready Host
+ * (the task-314 probe's ctx.get-at-apply race cannot happen on this path).
+ */
+export const inject = ["tools", "agents", "userQuestions"];
+
+/**
  * Host plugin entry.
  *
  * Fails closed: an invalid Config throws during load (before any business
- * read/write), and the connection is closed when the plugin unloads.
+ * read/write), and the connection is closed when the plugin unloads. When the
+ * Host surfaces are present, the six Agent tools are registered through the
+ * Host-provided defineTool (task-404); registration errors reject the load.
  */
-export function apply(ctx: Context, config: unknown): void {
+export function apply(ctx: Context, config: unknown): void | Promise<void> {
   const databasePath = resolveDatabasePath(config);
   ctx.effect(() => {
     const store = SQLiteDecisionStore.open({ databasePath });
@@ -112,4 +128,14 @@ export function apply(ctx: Context, config: unknown): void {
       store.close();
     };
   }, "dsh-decision store");
+  const surfaces = ctx as unknown as Partial<DecisionHostSurfaces>;
+  if (surfaces.tools === undefined || surfaces.agents === undefined || surfaces.userQuestions === undefined) {
+    // Minimal contexts (the L0 unit fixtures) carry only the store lifecycle.
+    // Under the real Host, `inject` above guarantees all three surfaces before
+    // cordis calls apply, so this branch never skips registration there.
+    return;
+  }
+  return import("./register.ts").then(({ registerDecisionToolsWithHost }) =>
+    registerDecisionToolsWithHost(surfaces as DecisionHostSurfaces, () => getDecisionStore(ctx)),
+  );
 }
