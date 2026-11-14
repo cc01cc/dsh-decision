@@ -51,7 +51,10 @@ const RE = {
   // 边界必须精确到「数字后紧跟全角（」——正文里的句首强调 **D-1117 的落点裁定
   // 不变**（… 不是条目（实测 D-1118 被它吞空）；同号补记/附记 **D-992 补记（…）**
   // 数字后是空格，不匹配本边界，按下方同号吸收规则并入母条目。
-  bold: /^\*\*D-(\d+)（(.*?)\*\*(.*)$/,
+  bold: /^\*\*\s*`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)（(.*?)\*\*(.*)$/,
+  // 同号附记（**D-1274 附记（…）**：数字后是标签词）：不是新条目边界，
+  // 而是母条目的补录。标签是封闭集，别放成任意文本（task-480 的宽正则教训）。
+  boldAdjunct: /^\*\*\s*`?(D-\d+)\s*(附记|补记|附注|补注|勘误)\s*（(.*?)\*\*(.*)$/,
   nextEntry: /^#{2,4}\s+\`?D-\d+/,
   section: /^##\s+(?!.*\`?D-\d)/,
   date: /(\d{4}-\d{2}-\d{2})/,
@@ -65,6 +68,21 @@ const RE = {
   replacesPassive: /被\s*\*{0,2}\`?D-(\d+)\`?\*{0,2}[^|。]{0,20}取代|已被\s*\*{0,2}\`?D-(\d+)\`?\*{0,2}\s*(?:取代|supersede)/gi,
   partial: /部分|①|②|③|前提|配套理由|事实判断/,
 };
+
+/**
+ * 多号枚举展开（标题/粗体共用一份实现）：
+ * - 区间「D-13 ～ D-16」= 13..16 全成员，不只是两个端点；
+ * - 并列枚举的第二号常省略 D- 前缀（实测 main:9810「**D-1375+1376（…）**」，
+ *   task-491 / dsd-1 独立盘点发现），故按「可选 D- + 数字」取号。
+ */
+function expandIdList(text) {
+  const compact = text.replace(/\s+/g, "");
+  const range = compact.match(/^D-(\d+)[～~]D-(\d+)$/);
+  if (range) {
+    return Array.from({ length: Number(range[2]) - Number(range[1]) + 1 }, (_, k) => "D-" + (Number(range[1]) + k));
+  }
+  return [...text.matchAll(/D?-?(\d+)/g)].map((m) => "D-" + m[1]);
+}
 
 function die(message, code = 2) {
   console.error(message);
@@ -136,6 +154,7 @@ function collectEntries(strict = false) {
   let level2Headings = 0;
   let bulletEntries = 0;
   let boldEntries = 0;
+  let adjunctEntries = 0;
   let multiNumberHeadings = 0;
   // 严格模式 = 盘点器 T1-e 原口径（###/#### 标题 + 表格行），## 与项目符号式
   // 条目不解析；用于 D-1251 条件「严格子集可复算」。
@@ -165,17 +184,8 @@ function collectEntries(strict = false) {
         flush();
         // 多号展开只认标题起首的并列枚举（D-802 / D-803 / …）；
         // 标题里被修订/引用/撤销的 D 号不是并列条目（防跨条正文污染）。
-        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[\/、,，～~]\s*`?D-\d+)*)/);
-        // 区间形态「D-13 ～ D-16」= 13..16 全部成员（不只是两个端点）。
-        let rawIds;
-        if (enumMatch) {
-          const range = enumMatch[1].match(/^D-(\d+)\s*[～~]\s*D-(\d+)$/);
-          rawIds = range
-            ? Array.from({ length: Number(range[2]) - Number(range[1]) + 1 }, (_, k) => "D-" + (Number(range[1]) + k))
-            : [...enumMatch[1].matchAll(/D-(\d+)/g)].map((m) => m[0]);
-        } else {
-          rawIds = ["D-" + h[2]];
-        }
+        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)/);
+        const rawIds = enumMatch ? expandIdList(enumMatch[1]) : ["D-" + h[2]];
         const uniqueRaw = [...new Set(rawIds)];
         const uniqueDnums = uniqueRaw.map((s) => Number(s.slice(2)));
         if (uniqueDnums.length > 1) multiNumberHeadings += 1;
@@ -201,21 +211,46 @@ function collectEntries(strict = false) {
         };
         return;
       }
+      // 同号附记（**D-1274 附记（…）**）：先于粗体条目判断——它的数字后是标签词。
+      // 母条目已开 ⇒ 直接 append（append-only）；未开 ⇒ 记 raw，等两遍去重时
+      // 找到自己的号再并入（不依赖「当时正打开哪一条」——task-491 的病灶）。
+      const ba = strict ? null : line.match(RE.boldAdjunct);
+      if (ba) {
+        const dnum = Number(ba[1].slice(2));
+        if (current && (current.dnums ?? [current.dnum]).includes(dnum)) {
+          current.bodyLines.push(line);
+          current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
+          return;
+        }
+        flush();
+        adjunctEntries += 1;
+        const rest = ba[4].replace(/^[：:]\s*/, "").trim();
+        current = {
+          dnum, dnums: [dnum], extId: ba[1], extIds: [ba[1]],
+          kind: "adjunct", file: src.label, line: lineNo,
+          headingLine: line,
+          title: ba[3].trim(),
+          bodyLines: rest ? [rest] : [],
+        };
+        return;
+      }
       const bo = strict ? null : line.match(RE.bold);
       if (bo) {
-        const dnum = Number(bo[1]);
-        if (current && (current.dnums ?? [current.dnum]).length === 1 && current.dnum === dnum) {
+        const ids = expandIdList(bo[1]).map((s) => Number(s.slice(2)));
+        const single = ids.length === 1;
+        if (current && single && (current.dnums ?? [current.dnum]).length === 1 && current.dnum === ids[0]) {
           // 同号补记/附记/补条（**D-992 补记…**）：append-only 归母条目正文。
           current.bodyLines.push(line);
           current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
           return;
         }
         flush();
-        boldEntries += 1;
+        if (single) boldEntries += 1; else multiNumberHeadings += 1;
         const inner = bo[2].replace(/\s*[）)]$/, "").trim();
         const rest = bo[3].replace(/^[：:]\s*/, "").trim();
+        const extIds = ids.map((d) => "D-" + d);
         current = {
-          dnum, dnums: [dnum], extId: "D-" + bo[1], extIds: ["D-" + bo[1]],
+          dnum: ids[0], dnums: ids, extId: extIds[0], extIds,
           kind: "bold", file: src.label, line: lineNo,
           headingLine: line,
           title: inner,
@@ -263,7 +298,11 @@ function collectEntries(strict = false) {
     prev.bodyLines = (prev.bodyLines ?? []).concat(fragment);
     prev.merged = (prev.merged ?? []).concat([{ file: entry.file, line: entry.line }]);
   };
-  for (const entry of raw) {
+  // 两遍去重：先落真实条目，再把「同号附记」并进各自母条目。
+  // 单遍会依赖「附记当时正打开哪一条」——task-491 实测：附记被别的条插开时
+  // 就落进了别人的正文（D-1274/D-1272 → D-1275 等 6 例）。
+  const ordered = [...raw.filter((e) => e.kind !== "adjunct"), ...raw.filter((e) => e.kind === "adjunct")];
+  for (const entry of ordered) {
     if (entry.kind === "index") {
       const cells = entry.cells;
       indexMeta.set(entry.dnum, { date: (cells[1] ?? "").match(RE.date)?.[1] ?? null, status: cells[3] ?? null, file: entry.file, line: entry.line });
@@ -279,7 +318,7 @@ function collectEntries(strict = false) {
   }
   const entries = [...byD.values()].sort((a, b) => a.dnum - b.dnum);
   return {
-    raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, multiNumberHeadings, statusNotes, entries, indexMeta,
+    raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, adjunctEntries, multiNumberHeadings, statusNotes, entries, indexMeta,
     mergedSupplements: entries.filter((e) => e.merged || e.adjunctMerged).map((e) => ({
       d: "D-" + e.dnum, kept: { file: e.file, line: e.line },
       merged: (e.adjunctMerged ?? []).concat(e.merged ?? []),
@@ -297,7 +336,7 @@ function buildDecision(entry, indexMeta) {
   let rationale = null;
   let dateText = null;
 
-  if (entry.kind === "heading" || entry.kind === "bullet" || entry.kind === "bold") {
+  if (entry.kind === "heading" || entry.kind === "bullet" || entry.kind === "bold" || entry.kind === "adjunct") {
     decision = entry.bodyLines.join("\n").trim();
     summary = entry.title || null;
     dateText = entry.title.match(RE.date)?.[1] ?? decision.match(RE.date)?.[1] ?? null;
@@ -387,7 +426,7 @@ function scanReplaces(built, byDnum, statusNotes) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const { raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, multiNumberHeadings, statusNotes, entries, indexMeta, mergedSupplements } = collectEntries(args.strict);
+  const { raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, adjunctEntries, multiNumberHeadings, statusNotes, entries, indexMeta, mergedSupplements } = collectEntries(args.strict);
   if (lineLevelT1e === 0) die("空扫描：两源文件零候选（空扫不是通过）");
 
   const built = entries.map((e) => ({ entry: e, ...buildDecision(e, indexMeta) }));
@@ -411,6 +450,7 @@ function main() {
       level2Headings,
       bulletEntries,
       boldEntries,
+      adjunctEntries,
       multiNumberHeadings,
       entryLevelCandidates: raw.length,
       entryKinds: entries.reduce((acc, e) => { acc[e.kind] = (acc[e.kind] ?? 0) + 1; return acc; }, {}),

@@ -86,6 +86,18 @@ test("全量迁移幂等双跑 + 保真对账全绿（D-1251 条件②）", { sk
 // task-480 / D-1383：粗体条目行 **D-xxxx（标题…）** 必须是解析边界。
 // 三处账必须对得上：独立盘点（不 import 迁移脚本）== 迁移 uniqueEntries
 // == 对账 created + manualQueue；关键条目各自独立且不超 20,000 码点。
+// task-491：多号枚举的第二个号常省略 D- 前缀（**D-1375+1376（…）**），
+// 区间「D-13 ～ D-16」展开全成员；同号附记（**D-1274 附记（…）**）是母条目补录。
+function expandIds(text) {
+  const compact = text.replace(/\s+/g, "");
+  const range = compact.match(/^D-(\d+)[～~]D-(\d+)$/);
+  if (range) return Array.from({ length: Number(range[2]) - Number(range[1]) + 1 }, (_, k) => Number(range[1]) + k);
+  return [...text.matchAll(/(\d+)/g)].map((m) => Number(m[1]));
+}
+
+const RE_ADJUNCT = /^\*\*\s*`?(D-\d+)\s*(附记|补记|附注|补注|勘误)\s*（/;
+const RE_BOLD_MULTI = /^\*\*\s*`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)（(.*?)\*\*(.*)$/;
+
 function independentInventory() {
   const files = [join(ONE, "internal/A03-xihe/docs/lead-decisions-ledger.md"), join(ONE, "internal/A03-xihe/docs/archive/lead-decisions-2026-11-05-to-2026-11-08.md")];
   const byD = new Map();
@@ -93,19 +105,26 @@ function independentInventory() {
     let cur = null;
     const flush = () => { if (cur) { for (const d of cur.dnums) if (!byD.has(d)) byD.set(d, cur.kind); cur = null; } };
     for (const line of readFileSync(file, "utf8").split("\n")) {
-      const h = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[\/、,，]\s*`?D-\d+)*)/);
+      const h = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)/);
       if (h) {
-        const uniq = [...new Set([...h[1].matchAll(/D-(\d+)/g)].map((x) => Number(x[1])))];
+        const uniq = [...new Set(expandIds(h[1]))];
         if (cur && cur.dnums.length === 1 && cur.dnums[0] === uniq[0]) continue; // 同号吸收
         flush(); cur = { dnums: uniq, kind: "heading" }; continue;
       }
       const b = line.match(/^-\s+\*\*D-(\d+)[｜|]?(.*?)\*\*[：:]?\s*(.*)$/);
       if (b) { flush(); cur = { dnums: [Number(b[1])], kind: "bullet" }; continue; }
-      const bo = line.match(/^\*\*D-(\d+)（(.*?)\*\*(.*)$/);
-      if (bo) {
-        const d = Number(bo[1]);
-        if (cur && cur.dnums.length === 1 && cur.dnums[0] === d) continue; // 同号补记吸收
+      const ba = line.match(RE_ADJUNCT);
+      if (ba) {
+        const d = Number(ba[1].slice(2));
+        // 附记不是新条目：自己号已有条目 ⇒ 并入（同号吸收）；否则按粗体条目登记。
+        if (byD.has(d)) { flush(); cur = null; continue; }
         flush(); cur = { dnums: [d], kind: "bold" }; continue;
+      }
+      const bo = line.match(RE_BOLD_MULTI);
+      if (bo) {
+        const ids = [...new Set(expandIds(bo[1]))];
+        if (ids.length === 1 && cur && cur.dnums.length === 1 && cur.dnums[0] === ids[0]) continue; // 同号补记吸收
+        flush(); cur = { dnums: ids, kind: "bold" }; continue;
       }
       if (cur) {
         const boundary = /^#{2,4}\s+`?D-\d+/.test(line) || /^##\s+(?!.*`?D-\d)/.test(line)
@@ -136,10 +155,13 @@ test("粗体条目行是边界且三处账对得上（task-480 / D-1383）", { s
   assert.equal(report.caliber.entryKinds?.bold ?? 0, kindCounts.bold ?? 0, "粗体条目数与独立盘点一致");
   // 关键回归：D-1247 不再吞并后续粗体条目、各自独立且不超上限。
   const oversized = report.caliber.parseFailed.filter((f) => f.reasons.some((r) => /超 20000/.test(r)));
-  for (const id of ["D-1247", "D-1248", "D-1250", "D-1374"]) {
+  for (const id of ["D-1247", "D-1248", "D-1250", "D-1374", "D-1375", "D-1376"]) {
     assert.ok(report.caliber.externalIds.includes(id), id + " 是候选条目（未被并入他条）");
     assert.ok(!oversized.some((f) => f.externalId === id), id + " 不超 20,000 码点");
   }
+  // task-491：多号粗体（**D-1375+1376（…）**）拆成两条；同号附记不另立条目。
+  assert.equal(report.caliber.entryKinds?.adjunct ?? 0, 0, "附记不另立条目（并入母条目）");
+  assert.ok((report.caliber.adjunctEntries ?? 0) > 0, "台账里确实有同号附记（判据非空转）");
   // 对账两侧口径一致：created + 人工队列 == uniqueEntries。
   assert.equal(report.caliber.parsedOk + report.caliber.parseFailed.length, report.caliber.uniqueEntries, "parsedOk + parseFailed == uniqueEntries");
 });
