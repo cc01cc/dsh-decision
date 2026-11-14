@@ -669,3 +669,97 @@ test("T424: search schema declares queryMode and keywords mode works end-to-end"
   assert.equal(refused.value.error.field, "queryMode", "fail-closed at the tool face too");
 });
 
+// ------------------------------------------------- task-1 dispatch-gap surface
+// Requirements §3 P0 through the model-facing face. The fixtures are the real
+// accident shapes: D-896 (effective, no task edge, alarm should fire), D-899
+// (registers a BL item and DID get a card), D-1277 (no references at all).
+
+test("task-1: decision_search answers the no-downstream-task question in one call, and the edge-kind summary stays opt-in", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const search = tools.get("decision_search");
+  const gapShape = await invoke(create, root, { decision: "D-896 shape", externalId: "D-896", refs: [{ type: "plan", id: "PLAN-0762" }] });
+  const carded = await invoke(create, root, { decision: "D-899 shape", externalId: "D-899", refs: [{ type: "task", id: "task-124" }] });
+  const bare = await invoke(create, root, { decision: "nothing referenced", externalId: "D-1277" });
+
+  // Default list unchanged: same three hits, same order, and no new keys.
+  const plain = await invoke(search, root, {});
+  assert.equal(plain.value.ok, true, JSON.stringify(plain.value));
+  assert.deepEqual(plain.value.data.decisions.map((d) => d.externalId), ["D-1277", "D-899", "D-896"]);
+  for (const item of plain.value.data.decisions) {
+    assert.equal("refs" in item, false, "list items never carry reference ids");
+    assert.equal("refTypes" in item, false, "the edge-kind summary is opt-in");
+  }
+
+  // The gap: D-896 and the bare record; D-899 is excluded because it HAS a task edge.
+  const gap = await invoke(search, root, { withoutRefType: "task" });
+  assert.equal(gap.value.ok, true, JSON.stringify(gap.value));
+  assert.deepEqual(gap.value.data.decisions.map((d) => d.externalId), ["D-1277", "D-896"]);
+  assert.equal(gap.value.data.decisions.some((d) => d.decisionId === carded.value.data.decisionId), false,
+    "a decision with a downstream task is not in the gap");
+
+  // One page answers both questions when the edge-kind summary is requested.
+  const listed = await invoke(search, root, { withoutRefType: "task", withRefTypes: true });
+  assert.equal(listed.value.ok, true, JSON.stringify(listed.value));
+  const byExt = new Map(listed.value.data.decisions.map((d) => [d.externalId, d]));
+  assert.deepEqual(byExt.get("D-896").refTypes, ["plan"], "kinds, not ids");
+  assert.deepEqual(byExt.get("D-1277").refTypes, []);
+  assert.equal(listed.value.data.hasMore, false);
+  assert.deepEqual(listed.value.data.decisions.map((d) => d.decisionId),
+    [bare.value.data.decisionId, gapShape.value.data.decisionId], "the flag does not reorder the page");
+
+  // Fail-closed at the tool face, as a domain envelope rather than a throw.
+  const badType = await invoke(search, root, { withoutRefType: "bl" });
+  assert.equal(badType.value.ok, false);
+  assert.equal(badType.value.error.code, "VALIDATION_FAILED");
+  assert.equal(badType.value.error.field, "withoutRefType");
+  const contradictory = await invoke(search, root, { refType: "task", refId: "task-124", withoutRefType: "task" });
+  assert.equal(contradictory.value.ok, false);
+  assert.equal(contradictory.value.error.field, "withoutRefType");
+});
+
+test("task-1: search schema declares the new inputs, the shared ref-type enum, and the refs summary", () => {
+  const deps = { agents: registryOf([liveAgent("s")]), openStore: () => ({}), asker: refusingAsker() };
+  const search = createDecisionTools(deps).find((tool) => tool.name === "decision_search");
+  const params = search.parameters;
+  assert.ok(params.withoutRefType !== undefined, "withoutRefType declared");
+  assert.notEqual(params.withoutRefType.required, true, "optional: omitting it adds no filter");
+  // One shared constant: the complement filter cannot drift from refType.
+  assert.deepEqual(params.withoutRefType.enum, params.refType.enum);
+  assert.deepEqual(params.withoutRefType.enum, ["decision", "task", "plan", "commit"]);
+  assert.equal(params.withoutRefType.enum.includes("bl"), false, "bl is not an edge kind, so not a filter value");
+  assert.ok(params.withRefTypes !== undefined, "withRefTypes declared");
+  assert.notEqual(params.withRefTypes.required, true, "off by default");
+  assert.equal(params.withRefTypes.type, "boolean");
+
+  const item = search.output.schema.properties.data.properties.decisions.items;
+  assert.ok(item.properties.refTypes !== undefined, "hits may carry the edge-kind summary");
+  assert.notEqual(item.properties.refTypes.required, true, "present only when asked for");
+  // One shared type domain, and the schema says "kinds only": array of enum
+  // strings, with no id property anywhere in the item shape.
+  assert.deepEqual(item.properties.refTypes.items.enum, params.refType.enum);
+  assert.equal(item.properties.refTypes.items.properties, undefined, "refTypes is a list of kinds, not objects");
+  assert.equal("refs" in item.properties, false, "the summary never carries ids");
+  assert.equal("refsTruncated" in item.properties, false, "no truncation flag: kinds cannot overflow");
+
+  // Wording contract (Lead ruling): describe the query, never claim the whole
+  // alarm — a BL item is not an edge, so "no task edge" cannot cover it.
+  assert.match(search.description, /withoutRefType/);
+  assert.match(search.description, /no downstream task/i);
+  assert.match(params.withoutRefType.description, /NO reference edge/);
+  assert.match(params.withoutRefType.description, /BL-/);
+  assert.equal(/落空决策/.test(search.description + params.withoutRefType.description), false,
+    "the label must not swallow the BL item classes");
+
+  // The list summary explains what it does NOT say (ids) and why it is not a
+  // seventh tool: the frozen model face is exactly the six names below.
+  assert.match(params.withRefTypes.description, /decision_get for the ids/i);
+  assert.match(params.withRefTypes.description, /six tools/i);
+  assert.match(params.withRefTypes.description, /decision-contract\.md §3/);
+  for (const name of DECISION_TOOL_NAMES) {
+    assert.ok(params.withRefTypes.description.includes(name), "frozen tool name listed: " + name);
+  }
+  assert.equal(DECISION_TOOL_NAMES.length, 6, "the frozen surface stays six tools");
+});
+

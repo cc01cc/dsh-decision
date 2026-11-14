@@ -377,7 +377,7 @@ const DECISION_RECORD: SchemaNode = objectNode({
 
 /** decision_search (contract lines 110-143). */
 const SEARCH_DESCRIPTION =
-"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. To answer \"has this decision been superseded?\", pass replacedDecisionId: only decisions that declare they replace that number are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring by default: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards. For a multi-word question pass queryMode 'keywords': the query is split on whitespace and every token must match (AND), each token still a literal substring — use it instead of guessing one exact phrase.";
+"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. Pass withoutRefType for the mirror question — only decisions with NO edge of that type (withoutRefType 'task' answers \"which decisions have no downstream task\"), and withRefTypes true to see, per hit, which kinds of edges exist (ids still come from decision_get). To answer \"has this decision been superseded?\", pass replacedDecisionId: only decisions that declare they replace that number are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring by default: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards. For a multi-word question pass queryMode 'keywords': the query is split on whitespace and every token must match (AND), each token still a literal substring — use it instead of guessing one exact phrase.";
 
 const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
   query: prop(STRING, false, "1–500 code points, not blank; an empty string is rejected. Omit query to list recent decisions in recency order (the default list). Searches summary, decision, rationale and source reference."),
@@ -386,6 +386,8 @@ const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
   refType: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, false, "Reverse query: only decisions referencing this type of item. Provide together with refId; bl is not a valid type (direction rule)."),
   refId: prop(STRING, false, "Reverse query: external key of the referenced item (e.g. T-194, D-1119, a commit sha), 1–200 code points. Provide together with refType; answers which decisions reference this key."),
   replacedDecisionId: prop(INTEGER, false, "Reverse supersession: return the decisions that declare they replace this DSD number (\"who superseded it?\"). Answers the opposite direction of the replaces field."),
+  withoutRefType: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, false, "Only decisions that have NO reference edge of this type — the complement of refType+refId, and the one-call way to ask which decisions have no downstream task (pass 'task'). A decision with no references at all qualifies. Omit it to keep the result as it is today: it adds no filter. What it does NOT answer: edges only cover decision/task/plan/commit, so a decision whose text names a backlog item (BL-…) carries no edge for it — \"no task edge\" means no card was dispatched from this record, not that nothing tracks it. It cannot be combined with the same refType (that pair can only ever be empty, so it is rejected)."),
+  withRefTypes: prop({ type: "boolean" }, false, "Also return, per hit, WHICH KINDS of references it has (a de-duplicated list drawn from decision, task, plan, commit, always in that fixed order). It answers \"did this decision ever get a card, and of which kinds\" on the same page, so a triage does not need one decision_get per hit. Default false: a page keeps exactly the fields it has today, and the flag never changes which hits match. It does NOT answer who the references point at — call decision_get for the ids. This is a field on the existing decision_search rather than a seventh tool on purpose: the frozen contract fixes the model-facing surface at six tools (decision_search, decision_get, decision_create, decision_create_batch, decision_update, decision_void — decision-contract.md §3)."),
   includeVoided: prop({ type: "boolean" }, false, "Include voided decisions; default false."),
   limit: prop(INTEGER, false, "Page size 1–20; default 10."),
   offset: prop(INTEGER, false, "Non-negative safe integer; default 0. Increase it to page."),
@@ -476,6 +478,14 @@ const SEARCH_DATA: SchemaNode = objectNode({
         timeHorizon: prop({ type: "string", enum: [...HORIZON] }, true, "long_term or temporary."),
         externalId: prop(NULLABLE, true, "External id (e.g. ledger D number) when set, else null; identifies hits without a follow-up get."),
         replaces: prop({ type: "array", items: INTEGER }, true, "The decisions this record declares it replaces; null when it declares none."),
+        refTypes: prop(
+          {
+            type: "array",
+            items: { type: "string", enum: [...DECISION_REF_TYPES] },
+          },
+          false,
+          "Present only when withRefTypes was true: the KINDS of edges this hit has, de-duplicated and in the fixed decision/task/plan/commit order; empty when it has none. Ids are not included — decision_get returns them.",
+        ),
       }),
     },
     true,

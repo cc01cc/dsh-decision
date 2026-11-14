@@ -125,6 +125,22 @@ node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/
 
 **`task-615` 的变异读数**：去掉投影写入 ⇒ 3 红（两条 `task-615` 夹具 + v1 升级夹具）；去掉反向过滤 ⇒ 4 红；反查索引改成非覆盖（只 `replaced_id`）⇒ **只红** `task-615` 存储夹具（`COVERING INDEX` 断言）；回填改成写“今天” ⇒ **只红** v2→v3 回填夹具（`created_at` 断言）。
 
+### 1.4 落空告警的底层能力：`withoutRefType` + `withRefTypes`（2026-11-15 `task-1` 落地）
+
+**结论**：需求 §3「生效决策没有下游 task」的**判定能力**已落地为 `decision_search` 的一个参数（**1 次调用**回答，不再需要 1+N 次 `get`）；同时给列表项一个 opt-in 的边类型摘要。设计、语义前提与两类无法覆盖的形态见 [`dispatch-gap-reverse-lookup-design.md`](dispatch-gap-reverse-lookup-design.md)。
+
+| 项 | 读数 | 证据等级 |
+| --- | --- | --- |
+| 真实台账清单（零改动，仅用既有 `search`+`get`） | 982 条全部 effective（**迁移脚本不变量**，不是台账事实）⇒ 无 task 边 **532 条**、无任何 refs 187 条、无 task 且无 BL 提及 413 条；1032 次调用 / 26 ms | `[实测]` |
+| 新参数 | `withoutRefType`（enum 与 `refType` 共用 `DECISION_REF_TYPES`，省略＝不加过滤）；`withRefTypes`（boolean，默认 false，只带边**类型**不带 id） | `[源码]` |
+| 命中 | `withoutRefType:'task'` = **532 条**（与零改动清单逐条相同）；`D-896` 在内，`D-899` 不在内 | `[实测]` |
+| 默认行为 | 982 条 id 序列 before/after **逐条相同**（`firstDiffIndex = -1`） | `[实测]` |
+| 页字节 | 默认页 1,727 → 2,053 B（**1.19×**）；真实最坏 20 条（全四类）1.19×；合成最坏（20×四类 + 短 preview）1.35×，固定 **47 B/条**。判据 = **Δ ≤ 50 B/条 且默认关闭**（原 1.3× 线因「比值非不变量」改判，留痕见设计档 §6） | `[实测]` |
+| 访问路径 | `SEARCH r USING COVERING INDEX uq_decision_refs_edge (decision_id=? AND ref_type=?)`，无 `SCAN decision_refs`；schema 不变（`user_version` 仍 3，无迁移） | `[实测]` |
+| 变异 | 去掉 `NOT EXISTS` ⇒ **3 红**（反例 D-899 出现在清单里）；`refTypes` 改回 SQL 行序 ⇒ **1 红**（`['plan','task']` vs `['task','plan']`） | `[实测]` |
+
+**口径更正**：§2 #3 把这条判成「完全不存在（作为能力）」，那是 2026-11-13 的状态；**能力半边现由本节参数承担**（需求 §3 的时间阈值 `N 天` 仍在 XH 侧自做，DSD 不提供）。**另两类事故形态不覆盖**：BL 登记但无决策/无卡（库里没有 BL 载体、`bl` 不是合法 ref 类型）、BL 有决策且挂了别的卡（「有边」≠「对得上」）—— 逐条 file:line 见设计档 §4，另卡处理。
+
 ---
 
 ## 2. 历史口径：§1–§8 的 8 条（按卡面要求逐条四态）

@@ -92,6 +92,13 @@ export interface DecisionSearchItem {
    * read from the AUTHORITY (replaces_json), not from the projection. null when
    * the record declares nothing. */
   replaces: number[] | null;
+  /** task-1 (原 task-624): present only when the caller passed withRefTypes:true.
+   * The KINDS of edges this hit has, de-duplicated and in the canonical
+   * DECISION_REF_TYPES order — never the ids. Enough to tell, on the same page,
+   * whether a dispatch-gap hit carries anything at all and of which kinds, so a
+   * triage does not fall back to 1+N decision_get calls; the ids stay on
+   * decision_get (the summary answers "which kinds", not "which targets"). */
+  refTypes?: DecisionRefType[];
 }
 
 export interface DecisionSearchPage {
@@ -516,6 +523,13 @@ interface DecisionSearchParsedInput {
   /** task-615 (609 G3): reverse supersession — "which decisions declare that
    * they replace this one". */
   replacedDecisionId: number | undefined;
+  /** task-1 (原 task-624): the complement of refType/refId — "which decisions
+   * carry NO edge of this type". The one query that answers requirements §3's
+   * P0 alarm ("effective decision with no downstream task") in one call. */
+  withoutRefType: DecisionRefType | undefined;
+  /** task-1: opt-in per-hit edge-kind summary (default false keeps the page
+   * byte shape of every existing caller unchanged). */
+  withRefTypes: boolean;
   /** task-424 (D-1257): "literal" is the frozen 377 substring semantics,
    * byte-identical default; "keywords" splits query on Unicode whitespace and
    * requires every token to match (AND of per-token literal-substring groups).
@@ -544,6 +558,8 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   let refType: DecisionRefType | undefined;
   let refId: string | undefined;
   let replacedDecisionId: number | undefined;
+  let withoutRefType: DecisionRefType | undefined;
+  let withRefTypes = false;
   let queryMode: "literal" | "keywords" | undefined;
   let hasQuery = false;
   for (const [key, value] of Object.entries(input)) {
@@ -569,6 +585,24 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
           return validationFailure("refType", "Expected ref type decision, task, plan or commit; a decision must not reference bl (direction rule).");
         }
         refType = value as DecisionRefType;
+      }
+      continue;
+    }
+    if (key === "withoutRefType") {
+      if (value !== undefined) {
+        if (typeof value !== "string" || !(DECISION_REF_TYPES as readonly string[]).includes(value)) {
+          // Same closed type set as refType (one shared constant): the filter is
+          // the complement of an edge kind that can actually exist.
+          return validationFailure("withoutRefType", "Expected ref type decision, task, plan or commit; a decision must not reference bl (direction rule).");
+        }
+        withoutRefType = value as DecisionRefType;
+      }
+      continue;
+    }
+    if (key === "withRefTypes") {
+      if (value !== undefined) {
+        if (typeof value !== "boolean") return validationFailure("withRefTypes", "Expected a boolean.");
+        withRefTypes = value;
       }
       continue;
     }
@@ -604,6 +638,12 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   if ((refType === undefined) !== (refId === undefined)) {
     return validationFailure(refType === undefined ? "refType" : "refId", "refType and refId must be provided together.");
   }
+  // task-1: "has no edge of type X" and "has the edge (X, id)" cannot both hold.
+  // Left unchecked this composes into a silently always-empty page — a filter
+  // that can only be right by accident. Fail closed instead (D-1074).
+  if (withoutRefType !== undefined && withoutRefType === refType) {
+    return validationFailure("withoutRefType", "withoutRefType contradicts refType: a decision cannot both carry and not carry the same reference type.");
+  }
   // task-424: the mode only modifies query; the default list has no query
   // semantics. Fail closed instead of silently ignoring the flag.
   if (queryMode !== undefined && !hasQuery) {
@@ -631,6 +671,8 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
         refType,
         refId,
         replacedDecisionId,
+        withoutRefType,
+        withRefTypes,
         queryMode: queryMode ?? "literal",
         keywords,
         includeVoided: parsed.data.includeVoided,
@@ -664,7 +706,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
     }
     offset = value;
   }
-  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, replacedDecisionId, queryMode: "literal" as const, keywords: [], includeVoided, limit, offset } };
+  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, replacedDecisionId, withoutRefType, withRefTypes, queryMode: "literal" as const, keywords: [], includeVoided, limit, offset } };
 }
 
 function timestamp(): string {
@@ -1301,6 +1343,36 @@ function previewText(content: string): string {
   return Array.from(content).slice(0, 240).join("");
 }
 
+/**
+ * Load the set of edge KINDS for a whole page of hits in ONE statement.
+ *
+ * Keyed by decision id; each value is ordered by the canonical DECISION_REF_TYPES
+ * order, never by the SQL row order — a summary whose order depends on insertion
+ * history is a fixture that passes today and drifts tomorrow, and the canonical
+ * order is also what makes two pages comparable byte for byte.
+ */
+function searchItemRefTypes(database: DatabaseSync, decisionIds: readonly number[]): Map<number, Set<DecisionRefType>> {
+  const kinds = new Map<number, Set<DecisionRefType>>();
+  if (decisionIds.length === 0) return kinds;
+  const placeholders = decisionIds.map(() => "?").join(", ");
+  const rows = many<{ decisionId: number; refType: DecisionRefType }>(database,
+    `SELECT DISTINCT decision_id AS decisionId, ref_type AS refType
+      FROM decision_refs WHERE decision_id IN (${placeholders})`,
+    [...decisionIds],
+  );
+  for (const row of rows) {
+    const set = kinds.get(row.decisionId) ?? new Set<DecisionRefType>();
+    set.add(row.refType);
+    kinds.set(row.decisionId, set);
+  }
+  return kinds;
+}
+
+/** Canonical order: the shared type constant decides, not the database. */
+function refTypesOf(kinds: Set<DecisionRefType> | undefined): DecisionRefType[] {
+  return DECISION_REF_TYPES.filter((type) => kinds?.has(type) === true);
+}
+
 function rowToProject(row: ProjectRow): ProjectRecord {
   return {
     projectId: row.projectId,
@@ -1644,7 +1716,7 @@ export class SQLiteDecisionStore {
     if (!parsed.ok) return parsed;
     this.assertOpen();
 
-    const { query, timeHorizon, refType, refId, replacedDecisionId, queryMode, keywords, includeVoided, limit, offset } = parsed.data;
+    const { query, timeHorizon, refType, refId, replacedDecisionId, withoutRefType, withRefTypes, queryMode, keywords, includeVoided, limit, offset } = parsed.data;
     const whereParts = ["project_id = ?"];
     const values: BindValue[] = [projectId.data];
     if (!includeVoided) whereParts.push("status = 'effective'");
@@ -1658,6 +1730,17 @@ export class SQLiteDecisionStore {
       // decisions reference this key" (requirements §11 item 3).
       whereParts.push("id IN (SELECT decision_id FROM decision_refs WHERE ref_type = ? AND ref_key = ?)");
       values.push(refType, refId);
+    }
+    if (withoutRefType !== undefined) {
+      // task-1 (原 task-624): the complement of the reverse filter — "which
+      // decisions have NO edge of this type". NOT EXISTS is the same access path
+      // read the other way round: uq_decision_refs_edge leads with decision_id,
+      // so each outer row costs one index probe and no table lookup. This is
+      // requirements §3's P0 alarm ("effective but no downstream task") in ONE
+      // call; a decision with no references at all satisfies it trivially, which
+      // is why the "no refs at all" alarm condition needs no second parameter.
+      whereParts.push("NOT EXISTS (SELECT 1 FROM decision_refs r WHERE r.decision_id = decisions.id AND r.ref_type = ?)");
+      values.push(withoutRefType);
     }
     if (replacedDecisionId !== undefined) {
       // task-615 (609 G3): the reverse supersession query. The subquery is
@@ -1702,6 +1785,13 @@ export class SQLiteDecisionStore {
       );
       const hasMore = rows.length > limit;
       const selected = hasMore ? rows.slice(0, limit) : rows;
+      // task-1: opt-in per-hit edge kinds. One extra query for the whole page
+      // (not one per hit), so the 1+N shape of the old surface never comes back;
+      // the page itself is unchanged — hasMore and the row order are computed
+      // before the kinds are read, so pagination cannot depend on this flag.
+      const refTypesByDecision = withRefTypes
+        ? searchItemRefTypes(this.database, selected.map((row) => row.decisionId))
+        : undefined;
       return {
         ok: true,
         data: {
@@ -1712,6 +1802,7 @@ export class SQLiteDecisionStore {
             timeHorizon: row.timeHorizon,
             externalId: row.externalId,
             replaces: row.replacesJson === null ? null : JSON.parse(row.replacesJson) as number[],
+            ...(refTypesByDecision === undefined ? {} : { refTypes: refTypesOf(refTypesByDecision.get(row.decisionId)) }),
           })),
           hasMore,
         },

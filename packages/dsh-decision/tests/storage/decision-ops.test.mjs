@@ -1385,3 +1385,202 @@ test("T424: keywords composes with reverse refs, timeHorizon and pagination", (t
   assert.equal(page2.length, 1, "keywords + pagination");
   assert.deepEqual([...page1, ...page2].map((d) => d.decisionId).sort(), [a.decisionId, b.decisionId, c.decisionId].sort());
 });
+
+// --- task-1 (原 task-624): the dispatch gap, and opt-in per-hit refs ---------
+// Requirements §3 P0 is "an effective decision with no downstream task". The
+// reverse filter refType+refId answers "who references T-x"; withoutRefType is
+// its complement and answers the alarm question in one call. Fixtures below are
+// the real accident shapes: D-896 (effective, refs to a plan and a decision, no
+// task) and D-899 (registers a BL item and DID get a task card, task-124).
+
+test("task-1: withoutRefType is the complement of the reverse filter — the dispatch gap in one call", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const d896 = dataOf(store.createDecision(p.projectId, {
+    decision: "top bar belongs to modules, navigation to the global rail",
+    summary: "D-896 shape: no card ever dispatched",
+    refs: [{ type: "plan", id: "PLAN-0762" }, { type: "decision", id: "D-894" }],
+  }));
+  const d899 = dataOf(store.createDecision(p.projectId, {
+    decision: "language switch moves into settings; hover submenu deferred",
+    summary: "D-899 shape: has a task edge",
+    refs: [{ type: "task", id: "task-124" }, { type: "decision", id: "D-896" }],
+  }));
+  const bare = dataOf(store.createDecision(p.projectId, { decision: "no references at all" }));
+
+  const ids = (input) => dataOf(store.searchDecisions(p.projectId, input)).decisions.map((d) => d.decisionId);
+
+  // The gap: no task edge. Recency order (bare, d899, d896) minus the one with a
+  // task edge. This assertion is the negative case that a missing NOT EXISTS
+  // turns red: without the filter d899 shows up in the gap list.
+  assert.deepEqual(ids({ withoutRefType: "task" }), [bare.decisionId, d896.decisionId]);
+  assert.equal(ids({ withoutRefType: "task" }).includes(d899.decisionId), false, "a decision WITH a task edge is not in the gap");
+
+  // Default (param omitted) is byte-for-byte the old list: all three, same order.
+  assert.deepEqual(ids({}), [bare.decisionId, d899.decisionId, d896.decisionId]);
+
+  // The filter is type-specific, not "has any refs": d899 has no plan edge, d896 does.
+  assert.deepEqual(ids({ withoutRefType: "plan" }), [bare.decisionId, d899.decisionId]);
+  // "No decision edge" picks up only the bare record.
+  assert.deepEqual(ids({ withoutRefType: "decision" }), [bare.decisionId]);
+  // No edges at all ⊂ no task edge: the requirement's second alarm condition
+  // needs no separate parameter.
+  assert.deepEqual(ids({ withoutRefType: "commit" }), [bare.decisionId, d899.decisionId, d896.decisionId]);
+
+  // Orthogonal to the status filter: voiding a no-ref decision removes it from
+  // the default gap sweep and brings it back with includeVoided.
+  dataOf(store.voidDecision(p.projectId, { decisionId: bare.decisionId, expectedRevision: 1, reason: "handled elsewhere" }));
+  assert.deepEqual(ids({ withoutRefType: "task" }), [d896.decisionId]);
+  assert.deepEqual(ids({ withoutRefType: "task", includeVoided: true }), [bare.decisionId, d896.decisionId]);
+
+  // Composes with keywords, horizon and paging, like every other filter.
+  assert.deepEqual(ids({ query: "top bar", withoutRefType: "task" }), [d896.decisionId]);
+  assert.deepEqual(ids({ query: "no references", withoutRefType: "task", includeVoided: true }), [bare.decisionId]);
+  assert.deepEqual(ids({ timeHorizon: "temporary", withoutRefType: "task" }), []);
+  const temp = dataOf(store.createDecision(p.projectId, { decision: "deferred, temporary", timeHorizon: "temporary" }));
+  assert.deepEqual(ids({ timeHorizon: "temporary", withoutRefType: "task" }), [temp.decisionId]);
+  const page1 = dataOf(store.searchDecisions(p.projectId, { withoutRefType: "task", limit: 1, offset: 0 }));
+  const page2 = dataOf(store.searchDecisions(p.projectId, { withoutRefType: "task", limit: 1, offset: 1 }));
+  assert.deepEqual(page1.decisions.map((d) => d.decisionId), [temp.decisionId]);
+  assert.equal(page1.hasMore, true);
+  assert.deepEqual(page2.decisions.map((d) => d.decisionId), [d896.decisionId]);
+  assert.equal(page2.hasMore, false);
+
+  // Project scope holds: another project's no-task decision never leaks in.
+  const other = project(store, "Borealis", "borealis");
+  dataOf(store.createDecision(other.projectId, { decision: "foreign bare" }));
+  assert.deepEqual(ids({ withoutRefType: "task" }), [temp.decisionId, d896.decisionId]);
+});
+
+test("task-1: withoutRefType validation is fail-closed (enum, contradiction, explicit undefined)", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "seed", refs: [{ type: "task", id: "T-1" }] }));
+  dataOf(store.createDecision(p.projectId, { decision: "bare seed" }));
+
+  // Same closed type set as refType: bl cannot be an edge, so it cannot be a filter.
+  const bl = store.searchDecisions(p.projectId, { withoutRefType: "bl" });
+  errorOf(bl, "VALIDATION_FAILED");
+  assert.equal(bl.error.field, "withoutRefType");
+  assert.match(bl.error.message, /direction rule/i);
+  for (const bad of ["issue", "", null, 42, {}, ["task"]]) {
+    const result = store.searchDecisions(p.projectId, { withoutRefType: bad });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "withoutRefType", JSON.stringify(bad));
+  }
+
+  // "Has the (task, X) edge" and "has no task edge" cannot both hold: left
+  // unchecked this composes into a silently always-empty page.
+  const contradictory = store.searchDecisions(p.projectId, { refType: "task", refId: "T-1", withoutRefType: "task" });
+  errorOf(contradictory, "VALIDATION_FAILED");
+  assert.equal(contradictory.error.field, "withoutRefType");
+  assert.match(contradictory.error.message, /contradicts/i);
+  // The same coordinates under a DIFFERENT type stay legal (they intersect).
+  const mixed = dataOf(store.searchDecisions(p.projectId, { refType: "plan", refId: "PLAN-0001", withoutRefType: "task" }));
+  assert.deepEqual(mixed.decisions.map((d) => d.decisionId), []);
+
+  // withRefTypes is a boolean and nothing else.
+  for (const bad of ["true", 1, null, {}]) {
+    const result = store.searchDecisions(p.projectId, { withRefTypes: bad });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "withRefTypes", JSON.stringify(bad));
+  }
+
+  // Explicit undefined is omission, not a half filter (same rule as refType).
+  const omitted = dataOf(store.searchDecisions(p.projectId, { withoutRefType: undefined }));
+  assert.deepEqual(omitted.decisions.map((d) => d.decisionId), dataOf(store.searchDecisions(p.projectId, {})).decisions.map((d) => d.decisionId));
+
+  // The frozen parser still rejects both fields: the extension lives outside it.
+  for (const input of [{ withoutRefType: "task" }, { withRefTypes: true }]) {
+    const direct = parseDecisionSearchInput({ query: "seed", ...input });
+    assert.equal(direct.ok, false);
+    assert.equal(direct.error.code, "VALIDATION_FAILED");
+  }
+});
+
+test("task-1: withRefTypes is opt-in, canonical and pagination-independent", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  // Insertion order is plan-then-task: the canonical order is task-then-plan, so
+  // this fixture can only pass if the summary is sorted by the shared constant
+  // instead of by SQL/insertion order.
+  const withTask = dataOf(store.createDecision(p.projectId, {
+    decision: "has a card",
+    refs: [{ type: "plan", id: "PLAN-1" }, { type: "task", id: "T-1" }, { type: "task", id: "T-2" }],
+  }));
+  const bare = dataOf(store.createDecision(p.projectId, { decision: "bare" }));
+  const wide = dataOf(store.createDecision(p.projectId, {
+    decision: "wide edges",
+    refs: Array.from({ length: 25 }, (_, i) => ({ type: "decision", id: "D-" + (1000 + i) })),
+  }));
+  const everything = dataOf(store.createDecision(p.projectId, {
+    decision: "all four kinds",
+    refs: [
+      { type: "commit", id: "abc1234" },
+      { type: "decision", id: "D-1" },
+      { type: "plan", id: "PLAN-1" },
+      { type: "task", id: "T-1" },
+    ],
+  }));
+
+  // Default page is unchanged: the new key is absent, not empty.
+  const plain = dataOf(store.searchDecisions(p.projectId, {}));
+  for (const item of plain.decisions) assert.equal("refTypes" in item, false, "no refTypes key without withRefTypes");
+
+  const listed = dataOf(store.searchDecisions(p.projectId, { withRefTypes: true }));
+  const byId = new Map(listed.decisions.map((d) => [d.decisionId, d]));
+  // Kinds only, de-duplicated, canonical order (task before plan, not insertion order).
+  assert.deepEqual(byId.get(withTask.decisionId).refTypes, ["task", "plan"]);
+  assert.deepEqual(byId.get(bare.decisionId).refTypes, [], "no edges reads as an empty list");
+  assert.deepEqual(byId.get(everything.decisionId).refTypes, ["decision", "task", "plan", "commit"]);
+  assert.deepEqual(byId.get(wide.decisionId).refTypes, ["decision"], "25 edges of one kind collapse to one entry");
+  // Ids stay on the record, never on the summary.
+  assert.equal("refs" in byId.get(withTask.decisionId), false, "the summary carries no ids");
+  assert.equal(dataOf(store.getDecision(p.projectId, { decisionId: withTask.decisionId })).refs.length, 3);
+
+  // Pagination does not depend on the flag: same ids, same hasMore, same order.
+  for (const limit of [1, 2, 3]) {
+    for (let offset = 0; offset < 4; offset += 1) {
+      const a = dataOf(store.searchDecisions(p.projectId, { limit, offset }));
+      const b = dataOf(store.searchDecisions(p.projectId, { limit, offset, withRefTypes: true }));
+      assert.deepEqual(b.decisions.map((d) => d.decisionId), a.decisions.map((d) => d.decisionId));
+      assert.equal(b.hasMore, a.hasMore);
+    }
+  }
+
+  // Composes with the gap filter: one page answers both questions (everything
+  // carries a task edge, so it is not in the gap; the other two are).
+  const gap = dataOf(store.searchDecisions(p.projectId, { withoutRefType: "task", withRefTypes: true }));
+  assert.deepEqual(gap.decisions.map((d) => d.decisionId), [wide.decisionId, bare.decisionId]);
+  assert.deepEqual(gap.decisions.map((d) => d.refTypes), [["decision"], []]);
+
+  // The summary never changes the FILTER: a decision whose only edge is a task
+  // stays out of the gap, with and without the flag (Lead constraint 4).
+  const taskOnly = dataOf(store.createDecision(p.projectId, { decision: "only a card", refs: [{ type: "task", id: "T-9" }] }));
+  for (const withRefTypes of [false, true]) {
+    const ids = dataOf(store.searchDecisions(p.projectId, { withoutRefType: "task", withRefTypes })).decisions.map((d) => d.decisionId);
+    assert.equal(ids.includes(taskOnly.decisionId), false, "task-only record stays out (withRefTypes=" + withRefTypes + ")");
+  }
+});
+
+test("task-1: the gap filter walks uq_decision_refs_edge and never scans the edge table", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "seed", refs: [{ type: "task", id: "T-1" }] }));
+  const plan = store.database
+    .prepare(`EXPLAIN QUERY PLAN
+      SELECT id FROM decisions
+      WHERE project_id = ? AND status = 'effective'
+        AND NOT EXISTS (SELECT 1 FROM decision_refs r WHERE r.decision_id = decisions.id AND r.ref_type = ?)
+      ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`)
+    .all(p.projectId, "task", 21, 0)
+    .map((row) => row.detail);
+  const edge = plan.find((detail) => /decision_refs/.test(detail)) ?? "";
+  // The decision_id prefix of the unique edge index is what makes a correlated
+  // probe cheap: it is a covering seek, not a per-row table lookup.
+  assert.match(edge, /uq_decision_refs_edge/, plan.join(" | "));
+  assert.match(edge, /decision_id=\?/, plan.join(" | "));
+  assert.match(edge, /ref_type=\?/, plan.join(" | "));
+  assert.equal(/SCAN decision_refs/.test(plan.join(" | ")), false, "no full scan of the edge table");
+  assert.match(plan.find((detail) => /decisions/.test(detail)) ?? "", /idx_decisions_project_updated/);
+});
