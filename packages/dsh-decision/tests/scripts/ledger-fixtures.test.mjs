@@ -142,3 +142,26 @@ test("夹具C：附记夹在宿主条目正文中间，不得把宿主后续正�
   );
   assert.equal(caliber.parseFailed.length, 0, "夹具C：不应有解析失败");
 });
+
+test("夹具D：附记正文并入母条目时只出现一次（重复并入必须红）", (t) => {
+  const { ids, decisions, caliber } = migrate(t, "fixture-d-adjunct-dedupe.md");
+  assertSameIds(ids, ["D-941", "D-942", "D-943"], "夹具D");
+  // 探针必须是**正文本体**（rest），不是标题括注：重复并入时被并两遍的是 rest
+  // —— 它是 headingLine 的子串。用标题里的标记测不出重复（这正是 dsd-2 回退② 全绿的原因）。
+  const marker = "这段附记正文只能进 D-941 一次，并两遍即为缺陷。";
+  const occurrences = decisions.get("D-941").split(marker).length - 1;
+  assert.equal(
+    occurrences,
+    1,
+    "夹具D：附记正文本体在 D-941 里出现 " + occurrences + " 次（应为 1）—— " +
+      (occurrences === 0
+        ? "附记没并入母条目"
+        : "并入时 headingLine 与 bodyLines 各并了一次（同一段正文进两遍）"),
+  );
+  // 反向：不得为了去重把附记丢给别人
+  assert.ok(
+    !decisions.get("D-942").includes(marker),
+    "夹具D：附记正文落到了 D-942 —— 去重不能靠「不并」或「并错号」蒙对",
+  );
+  assert.equal(caliber.parseFailed.length, 0, "夹具D：不应有解析失败");
+});
