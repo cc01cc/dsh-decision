@@ -47,6 +47,11 @@ const RE = {
   t1eHeading: /^#{3,4}\s+\`?D-\d+/,
   // 项目符号式条目（§3 早期形态）：- **D-753｜标题**：正文…
   bullet: /^-\s+\*\*D-(\d+)[｜|]?(.*?)\*\*[：:]?\s*(.*)$/,
+  // 粗体行首式条目（§3 近期大量形态，task-480）：**D-1248（标题…）**：正文…
+  // 边界必须精确到「数字后紧跟全角（」——正文里的句首强调 **D-1117 的落点裁定
+  // 不变**（… 不是条目（实测 D-1118 被它吞空）；同号补记/附记 **D-992 补记（…）**
+  // 数字后是空格，不匹配本边界，按下方同号吸收规则并入母条目。
+  bold: /^\*\*D-(\d+)（(.*?)\*\*(.*)$/,
   nextEntry: /^#{2,4}\s+\`?D-\d+/,
   section: /^##\s+(?!.*\`?D-\d)/,
   date: /(\d{4}-\d{2}-\d{2})/,
@@ -130,6 +135,7 @@ function collectEntries(strict = false) {
   let lineLevelT1e = 0;
   let level2Headings = 0;
   let bulletEntries = 0;
+  let boldEntries = 0;
   let multiNumberHeadings = 0;
   // 严格模式 = 盘点器 T1-e 原口径（###/#### 标题 + 表格行），## 与项目符号式
   // 条目不解析；用于 D-1251 条件「严格子集可复算」。
@@ -186,6 +192,28 @@ function collectEntries(strict = false) {
         };
         return;
       }
+      const bo = strict ? null : line.match(RE.bold);
+      if (bo) {
+        const dnum = Number(bo[1]);
+        if (current && (current.dnums ?? [current.dnum]).length === 1 && current.dnum === dnum) {
+          // 同号补记/附记/补条（**D-992 补记…**）：append-only 归母条目正文。
+          current.bodyLines.push(line);
+          current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
+          return;
+        }
+        flush();
+        boldEntries += 1;
+        const inner = bo[2].replace(/\s*[）)]$/, "").trim();
+        const rest = bo[3].replace(/^[：:]\s*/, "").trim();
+        current = {
+          dnum, dnums: [dnum], extId: "D-" + bo[1], extIds: ["D-" + bo[1]],
+          kind: "bold", file: src.label, line: lineNo,
+          headingLine: line,
+          title: inner,
+          bodyLines: rest ? [rest] : [],
+        };
+        return;
+      }
       if (current) {
         const boundary = RE.nextEntry.test(line) || sectionRe.test(line)
           || (current.kind === "bullet" && /^-\s/.test(line));
@@ -238,7 +266,7 @@ function collectEntries(strict = false) {
   }
   const entries = [...byD.values()].sort((a, b) => a.dnum - b.dnum);
   return {
-    raw, lineLevelT1e, level2Headings, bulletEntries, multiNumberHeadings, statusNotes, entries, indexMeta,
+    raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, multiNumberHeadings, statusNotes, entries, indexMeta,
     mergedSupplements: entries.filter((e) => e.merged || e.adjunctMerged).map((e) => ({
       d: "D-" + e.dnum, kept: { file: e.file, line: e.line },
       merged: (e.adjunctMerged ?? []).concat(e.merged ?? []),
@@ -256,7 +284,7 @@ function buildDecision(entry, indexMeta) {
   let rationale = null;
   let dateText = null;
 
-  if (entry.kind === "heading" || entry.kind === "bullet") {
+  if (entry.kind === "heading" || entry.kind === "bullet" || entry.kind === "bold") {
     decision = entry.bodyLines.join("\n").trim();
     summary = entry.title || null;
     dateText = entry.title.match(RE.date)?.[1] ?? decision.match(RE.date)?.[1] ?? null;
@@ -342,7 +370,7 @@ function scanReplaces(built, byDnum, statusNotes) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const { raw, lineLevelT1e, level2Headings, bulletEntries, multiNumberHeadings, statusNotes, entries, indexMeta, mergedSupplements } = collectEntries(args.strict);
+  const { raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, multiNumberHeadings, statusNotes, entries, indexMeta, mergedSupplements } = collectEntries(args.strict);
   if (lineLevelT1e === 0) die("空扫描：两源文件零候选（空扫不是通过）");
 
   const built = entries.map((e) => ({ entry: e, ...buildDecision(e, indexMeta) }));
@@ -365,8 +393,10 @@ function main() {
       lineLevelT1e,
       level2Headings,
       bulletEntries,
+      boldEntries,
       multiNumberHeadings,
       entryLevelCandidates: raw.length,
+      entryKinds: entries.reduce((acc, e) => { acc[e.kind] = (acc[e.kind] ?? 0) + 1; return acc; }, {}),
       uniqueEntries: entries.length,
       indexRowsMerged: indexMeta.size,
       statusWritebackRows: statusNotes.length,

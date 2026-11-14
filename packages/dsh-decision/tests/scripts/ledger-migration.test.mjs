@@ -39,16 +39,21 @@ test("严格 T1-e 子集可复算且为扩展集真子集（D-1251 条件①）"
   const dir = scratch(t);
   const strict = migrate(["--dry-run", "--strict"], join(dir, "strict.json"));
   const ext = migrate(["--dry-run"], join(dir, "ext.json"));
-  // 台账是活文档：解析失败不钉死 0，钉「每个失败都有结构化原因且不进候选」
-  // （实测 2026-11-14 09:2x：D-1247 单条正文 210,903 码点超冻结 20,000 上限
-  //  ⇒ 进人工队列是 fail-closed 的正确行为，不是回归）。
+  // 台账是活文档：解析失败不钉死 0，钉「每个失败都有结构化原因且不进候选」。
+  // （2026-11-14 09:2x 曾见 D-1247 单条 210,903 码点：根因是粗体条目行
+  //  **D-xxxx（…）** 未作边界、近 141 条被折进上一条正文——task-480 已修
+  //  边界；仍保留本断言防回归：任何超限条目必须带结构化原因进人工队列。）
   const strictFailed = strict.caliber.parseFailed.map((f) => f.externalId).sort();
   const extFailed = ext.caliber.parseFailed.map((f) => f.externalId).sort();
-  assert.deepEqual(strictFailed, extFailed, "两个口径的失败集一致（同一批条目）");
-  for (const f of ext.caliber.parseFailed) {
-    assert.ok(Array.isArray(f.reasons) && f.reasons.length > 0, f.externalId + " 有结构化失败原因");
-    assert.ok(!ext.caliber.externalIds.includes(f.externalId), f.externalId + " 未进候选集（fail-closed）");
-    assert.ok(f.reasons.every((r) => typeof r === "string" && r.length > 0), f.externalId + " 原因非空");
+  // 严格口径是盘点器 T1-e 原正则（###/####+表格行，不含粗体边界）⇒ 其正文
+  // 只可能更长，失败集是扩展集失败集的超集；扩展集失败必在严格集失败内。
+  assert.deepEqual(extFailed.filter((id) => !strictFailed.includes(id)), [], "扩展集失败 ⊆ 严格集失败");
+  for (const [label, r] of [["严格", strict], ["扩展", ext]]) {
+    for (const f of r.caliber.parseFailed) {
+      assert.ok(Array.isArray(f.reasons) && f.reasons.length > 0, label + " " + f.externalId + " 有结构化失败原因");
+      assert.ok(!r.caliber.externalIds.includes(f.externalId), label + " " + f.externalId + " 未进候选集（fail-closed）");
+      assert.ok(f.reasons.every((x) => typeof x === "string" && x.length > 0), label + " " + f.externalId + " 原因非空");
+    }
   }
   // 候选数 = 条目数 − 解析失败数（uniqueEntries 含失败条目，parsedOk 才是可迁移者）。
   assert.equal(strict.caliber.parsedOk, strict.caliber.uniqueEntries - strict.caliber.parseFailed.length, "严格口径 parsedOk 自洽");
@@ -76,6 +81,65 @@ test("全量迁移幂等双跑 + 保真对账全绿（D-1251 条件②）", { sk
   const recon = JSON.parse(reconRaw);
   assert.equal(recon.failed, 0, "对账零失败: " + JSON.stringify(recon.checks.filter((c) => !c.ok)));
   assert.ok(recon.passed >= 16, "对账至少 16 项（含跨条污染检测）");
+});
+
+// task-480 / D-1383：粗体条目行 **D-xxxx（标题…）** 必须是解析边界。
+// 三处账必须对得上：独立盘点（不 import 迁移脚本）== 迁移 uniqueEntries
+// == 对账 created + manualQueue；关键条目各自独立且不超 20,000 码点。
+function independentInventory() {
+  const files = [join(ONE, "internal/A03-xihe/docs/lead-decisions-ledger.md"), join(ONE, "internal/A03-xihe/docs/archive/lead-decisions-2026-11-05-to-2026-11-08.md")];
+  const byD = new Map();
+  for (const file of files) {
+    let cur = null;
+    const flush = () => { if (cur) { for (const d of cur.dnums) if (!byD.has(d)) byD.set(d, cur.kind); cur = null; } };
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      const h = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[\/、,，]\s*`?D-\d+)*)/);
+      if (h) {
+        const uniq = [...new Set([...h[1].matchAll(/D-(\d+)/g)].map((x) => Number(x[1])))];
+        if (cur && cur.dnums.length === 1 && cur.dnums[0] === uniq[0]) continue; // 同号吸收
+        flush(); cur = { dnums: uniq, kind: "heading" }; continue;
+      }
+      const b = line.match(/^-\s+\*\*D-(\d+)[｜|]?(.*?)\*\*[：:]?\s*(.*)$/);
+      if (b) { flush(); cur = { dnums: [Number(b[1])], kind: "bullet" }; continue; }
+      const bo = line.match(/^\*\*D-(\d+)（(.*?)\*\*(.*)$/);
+      if (bo) {
+        const d = Number(bo[1]);
+        if (cur && cur.dnums.length === 1 && cur.dnums[0] === d) continue; // 同号补记吸收
+        flush(); cur = { dnums: [d], kind: "bold" }; continue;
+      }
+      if (cur) {
+        const boundary = /^#{2,4}\s+`?D-\d+/.test(line) || /^##\s+(?!.*`?D-\d)/.test(line) || (cur.kind === "bullet" && /^-\s/.test(line));
+        if (boundary) flush(); else continue;
+      }
+      const r = line.match(/^\|\s*`?D-(\d+)`?\s*\|/);
+      if (r) {
+        const cells = line.split("|").slice(1, -1).map((c) => c.trim());
+        if (cells.length <= 6) continue; // 索引行/状态回写行不是条目
+        const d = Number(r[1]);
+        if (!byD.has(d)) byD.set(d, "row");
+      }
+    }
+    flush();
+  }
+  return byD;
+}
+
+test("粗体条目行是边界且三处账对得上（task-480 / D-1383）", { skip: SKIP ? skipReason : false }, (t) => {
+  const dir = scratch(t);
+  const report = migrate(["--dry-run"], join(dir, "ext.json"));
+  const inventory = independentInventory();
+  const kindCounts = [...inventory.values()].reduce((acc, k) => { acc[k] = (acc[k] ?? 0) + 1; return acc; }, {});
+  assert.ok(kindCounts.bold > 0, "台账存在粗体式条目（边界生效）");
+  assert.equal(inventory.size, report.caliber.uniqueEntries, "独立盘点去重数 == 迁移 uniqueEntries");
+  assert.equal(report.caliber.entryKinds?.bold ?? 0, kindCounts.bold ?? 0, "粗体条目数与独立盘点一致");
+  // 关键回归：D-1247 不再吞并后续粗体条目、各自独立且不超上限。
+  const oversized = report.caliber.parseFailed.filter((f) => f.reasons.some((r) => /超 20000/.test(r)));
+  for (const id of ["D-1247", "D-1248", "D-1250", "D-1374"]) {
+    assert.ok(report.caliber.externalIds.includes(id), id + " 是候选条目（未被并入他条）");
+    assert.ok(!oversized.some((f) => f.externalId === id), id + " 不超 20,000 码点");
+  }
+  // 对账两侧口径一致：created + 人工队列 == uniqueEntries。
+  assert.equal(report.caliber.parsedOk + report.caliber.parseFailed.length, report.caliber.uniqueEntries, "parsedOk + parseFailed == uniqueEntries");
 });
 
 test("小批 recent-20 幂等双跑", { skip: SKIP ? skipReason : false }, (t) => {
