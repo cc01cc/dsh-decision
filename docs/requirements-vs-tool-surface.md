@@ -1,6 +1,6 @@
 # DSD 需求 ↔ 六工具面 对齐表
 
-> **状态**：对照结论（无实现改动）· **日期**：2026-11-13 · **卡片**：`task-330`
+> **状态**：~~对照结论（无实现改动）~~ **已被 2026-11-14 复核取代** —— 当时判「完全不存在」的 4 条**已全部实现**，见 [§1.1](#11-2026-11-14-复核4-条全部已实现task-592-复核产出) · **原日期**：2026-11-13（`task-330`）· **复核**：2026-11-14（`task-592`）
 > **对照对象**：`internal/A03-xihe/docs/dsd-decision-requirements.md`（用户经 Lead 转交的需求清单，XH 侧维护）
 > **对照面**：本仓六个工具 + 存储层 schema（`packages/dsh-decision/src`）
 > **证据等级**：`[源码]` 读代码得 / `[实测]` 本机跑得（复算方式见 §5）/ `[推断]` 由前两者推论，未单独验证
@@ -11,6 +11,8 @@
 
 第一句，最该先做的一条：
 
+> ⚠️ **2026-11-14 复核：下面第 0/1 节是 11-13 的判断，四条现均以实现落地，见 §1.1。** 保留原文是因为「为什么它排第一」的推理仍然成立（也正是它被最先实现的理由）。
+>
 > **`create` 的外部幂等键 `external_id`。** 因为它是四件要务里**唯一一件「不做就会永久产生新脏数据」**的：其余三件做错了都能事后修（方向错了改、查询可后补、默认列表可后补），而重复写入**修不掉** —— 本插件**没有物理删除**，`decision_void` 只能作废，重复记录会永久占着 id 空间并出现在每一次搜索结果里。
 
 第二句，必须先说清楚的**卡面前提有两处偏差**（不纠正就会答错题）：
@@ -33,7 +35,33 @@
 | 3 | 「一条反向查询：`query --refs-of <decision> --type task` 回答『这条决策有没有下游 task』」；判据：任意决策能答存在/不存在，且**不需要告警守护进程** | **完全不存在** | 六工具固定为 `decision_search` / `get` / `create` / `create_batch` / `update` / `void`（`tools.ts:44-51`，运行时打印实测）；`searchDecisions` 要求 `projectId` 且 `query` **必填**（空参实测 `VALIDATION_FAILED / Expected a string / field: query`）⇒ 不存在「不查关键词就能列」的入口，更没有反向遍历 | `[源码]` + `[实测]` | **3**。它**依赖 2**：没有 `refs` 就没有可反向遍历的边。**但可以先行**：先做 `refs` 列 + 反向索引，查询命令后补 —— 需求方原话也只要求「保证反向索引存在，不需要暴露成查询 API」 |
 | 4 | 「两个可选字段：`time_scope`（临时/长期，**默认长期**）+ `replaces: [id]`（写在新条上，旧条不改）」；判据：默认列表能把「临时」与「长期」**分开列出**；新条能声明它取代谁 | **拆分：`time_scope` 已有但不达标；`replaces` 完全不存在** | **字段已有**：`time_horizon TEXT NOT NULL DEFAULT 'temporary' CHECK IN ('long_term','temporary')`（`sqlite-store.ts:344-345`）；入参 `timeHorizon`（`tools.ts:311` 可选、`:325` get 返回、`:396` update 可改）（源码）。**两处不达标**：① 默认值是 temporary，需求要**默认长期**（实测：不传该字段 ⇒ `timeHorizon` 为 temporary）；② **判据不可达**：`search` 的 `query` 必填，**根本不存在「默认列表」**；且搜索结果项只有 `decisionId / preview / status` 三个键，**不含 `timeHorizon`**，也无法按它筛选（把 `timeHorizon` 传给 search ⇒ `VALIDATION_FAILED / Unknown field`）（实测）。**`replaces` 完全不存在**：无列，入参被拒 `Unknown field / field: replaces`（实测） | `[源码]` + `[实测]` | **2**。`replaces` 与 1 同批便宜（一列 + 入参），但把默认值改成 long_term 是**行为变更**（存量行不受影响，只影响未来 insert）⇒ 要么同批加迁移默认，要么先只补「默认列表」这个读面 |
 
+> ⚠️ **这张表是 2026-11-13 的快照，2026-11-14 已全部过时。** 下面 §1.1 是复核后的现状；**读现状请看 §1.1，不要看本表的「现状」列**。
+
 **一句话读这张表**：4 条里**只有 `time_scope` 的字段层是现成的**（且默认值与判据都不达标），其余三条连列都没有。
+
+### 1.1 2026-11-14 复核：4 条**全部已实现**（task-592 复核产出）
+
+**结论：§1 表里的「完全不存在」四条，在 HEAD `f7eb936` 上全部落地。** 本表作废原因不是写错，是**写完之后 15 个提交**（`d4765ab` task-377 起）把它们实现了 —— 又一处「两边都真、接缝没人看」。**下一个人若照 §1 派活，会重复实现已有能力。**
+
+| # | 判据（原表） | 现状（HEAD `f7eb936`） | 锚点 | 读数 |
+| --- | --- | --- | --- | --- |
+| 1 | 同一 `external_id` 重复 create ⇒ 返回已存在，不新建 | **已实现**（`d4765ab` task-377） | 列 `sqlite-store.ts:791-796`（`EXTERNAL_ID_COLUMN_SQL`）、`:869`（表内引用）、唯一索引 `:884`；入参 `host/tools.ts:319`（`sharedDecisionParameters`）、batch 同源 `:413`；查重 `sqlite-store.ts:1376-1384`（create，事务内）、`:1419-1449`（batch，含批内与批间） | `PRAGMA table_info` 17 列含 `external_id TEXT`；`uq_decisions_external_id ON decisions(external_id)`；连 create 两次 ⇒ `decisions` 仍 1 行，第二次 `decisionId` 相同 + `alreadyExisted: true`；848 行 9 批跑完再整轮重跑 ⇒ `createdCount 0`、`decisionId` 序列逐项相同、行数不变 |
+| 2 | `refs` 方向由类型约束：decision 不允许 bl；写反方向被拒 | **已实现**（`d4765ab` task-377；`afc0f6f` task-405 追加） | `decision_refs` 表 `sqlite-store.ts:911-925`（`ck_decision_refs_type` 闭集 `decision/task/plan/commit`）、方向校验 `:285`、反向索引 `:888` | 传 `refs:[{type:"bl"}]` ⇒ `VALIDATION_FAILED`，`field: refs`，消息点名方向规则；`refs:[{type:"task",id:"T-194"}]` 写入后 `get` 返回该边；`search{refType:"task",refId:"T-194"}` 命中那条、不命中无关条 |
+| 3 | 一条反向查询，回答「这条决策有没有下游 task」 | **已实现**（`f7a0bde` task-393） | `getDecision` 返回 `refs` `sqlite-store.ts:1488-1494`；反向过滤 `refType/refId` `:473-560`、`:1515-1517`（走 `idx_decision_refs_reverse`）；工具面 `tools.ts:357-365` | 见第 2 行读数；无需第七个工具、不依赖告警进程 |
+| 4 | `time_scope` 默认长期 + `replaces` + 默认列表 | **已实现**（`d4765ab` task-377；`9c71611`/`ea6dcb8` 补列表与筛选） | 默认 `time_horizon ... DEFAULT 'long_term'` `sqlite-store.ts:858-859`；`replaces` `REPLACES_JSON_COLUMN_SQL` `:869`/`:870`、入参 `tools.ts:331-335`；列表（`query` 变可选）`:1507-1520`、筛选 `timeHorizon` | 不传该字段 ⇒ `timeHorizon = long_term`；`searchDecisions(pid,{})` 返回 2 条（无需关键词）；`{timeHorizon:"temporary"}` 只返回临时那条；新建带 `replaces:[2]` ⇒ `get` 返回 `[2]`，旧条未被修改 |
+
+**§1 #1 的 NULL 语义（卡面要求「显式决定并写进卡面」）** —— 现状已成事实，且是**允许**：
+
+> **未传 `external_id` 的记录允许多条**（唯一索引把 NULL 视为互不相等）。决策已由 `d4765ab` 落地并在工具描述里明说：`CREATE_BATCH_DESCRIPTION`（`tools.ts:408-410`）「Rows without externalId are not deduplicated — do not re-submit them blindly.」实测：连建 5 条不带键的记录 ⇒ `external_id IS NULL` 行数 7（含前序），无报错。
+
+**复核口径**：本次 `[实测]` 用一次性探针（`.tmp/dsd-592/probe*.mjs`，不入 git，建系统临时库、用完即删），全部直连 `src/storage/sqlite-store.ts`（Node 24 类型剥离，零构建）。**复算命令**：
+
+```
+cd A12-DSH-decision/packages/dsh-decision
+node --test tests/storage/decision-ops.test.mjs tests/storage/sqlite-store.test.mjs tests/host/tools.test.mjs
+```
+
+读数：**86 / 86 绿，exit 0**（含 5 条 `T377` 专项）。变异自证：把 `createDecision` 的外部键查重整段删掉 ⇒ 上述套件 **4 红**（`T377: decision_create dedupes…`、`create with externalId…`、`dedupe returns the existing record's current revision…`、`external_id uniqueness spans projects…`）⇒ 幂等键**有夹具看守**，不是只靠读数。
 
 ---
 
