@@ -30,7 +30,7 @@
 
 > **四条现状一句话（2026-11-14 `task-609` 收口，读这里就够了）**：① 外部幂等键 `external_id` **已实现**（大小写/零填充不折叠，含首尾空白的键直接拒；跨项目命中回执带归属）；② `refs` 类型与方向约束 **已实现**（`bl` 写反方向被拒）；③ 反向查询 **已实现**（`decision_get` 答「这条决策有没有下游 task」，`search{refType,refId}` 答「谁引用了 X」，不需要告警进程）；④ `time_scope` **默认长期** + 默认列表按临时/长期分别列出 + `replaces` 声明 **已实现**。
 >
-> **四条判据均已绿；剩下的问题都不是「没做」，而是「做成了声明语义」**（refs / replaces 的目标不解析、不校验）—— 形态与最小修法见 §1.3，不要在下一张卡里重做实现。
+> **四条判据均已绿；剩下的问题都不是「没做」，而是「做成了声明语义」**（G1/G3：`refs`/`replaces` 的**目标**不解析、不能反查；G2 自引用已由 `task-614` 关掉）—— 形态与最小修法见 §1.3，不要在下一张卡里重做实现。
 >
 > 下表「现状」列是 2026-11-13 的快照，**已作废**，只看历史价值。
 
@@ -109,7 +109,7 @@ node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/
 | # | 缺口 | 现状读数 | 最小修法 | 形态 |
 | --- | --- | --- | --- | --- |
 | G1 | `refs` 的目标不解析：不存在或别的项目的 key 照样写入 | `refs:[{task,T-NOT-EXIST}]` ⇒ 接受；`get` 回显该边；反向查询 `{task,T-NOT-EXIST}` 仍命中；`{decision,99999}`（本库无此决策）同样接受 | 写时校验目标存在且同项目 | **建议不修**：账本迁移需要前向引用（被引用的 task 可能后到）。文档口径：「有下游 task」= **声明了 task 边**，不等于该 task 在本库存在 |
-| G2 | `replaces` 不解析、不防自引用 | `replaces:[99999]` 接受；**`replaces:[下一行自己的 id]` 也接受** ⇒ 一条决策能声明「取代自己」（实测该新行 id 恰等于所声明的数字） | insert 后比对 `decisionId ∈ replaces` 并回滚 | **建议修**（约 5 行 + 1 夹具），但属新增行为 ⇒ 需裁定，不在本卡 |
+| G2 | ~~`replaces` 不防自引用~~ | **已修（`task-614`）**：`replaces:[本行自己的 id]` ⇒ `VALIDATION_FAILED / field: replaces`，整笔回滚（单条行数不变；批内 `itemIndex 1`、整批 0 行）；`replaces:[99999]` 仍接受（G1 的前向引用，不动） | 已按最小修法落地：insert 后比对 `decisionId ∈ replaces` ⇒ 抛错回滚（`SelfReplaceError`） | **已修**；变异去掉该检查 ⇒ 只红 `task-614` 那一条夹具 |
 | G3 | 没有「谁取代了它」的反查 | `search{replacedBy: id}` ⇒ `VALIDATION_FAILED / Unknown field`；列表项不含 `replaces` ⇒ 不知道 id 就看不到后继 | 建 `decision_replaces(decision_id, replaced_id)` 关联表 + 反查参数 | 新增能力，另开卡（与 G1 同源：把声明变成边） |
 | G4 | `update` 不能改 `replaces`/`externalId` | `patch.replaces` ⇒ `VALIDATION_FAILED / field: patch.replaces` | 同 §1.2 `externalId`：声明只能建时给 | **不修（既定口径）**；建记录时没声明，之后补不了 |
 

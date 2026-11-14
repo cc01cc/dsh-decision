@@ -772,7 +772,53 @@ test("replaces is a declaration: a not-yet-existing number is accepted and reada
   assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId })).replaces, [99999]);
 });
 
-test("task-609: replaces is a declaration — unknown and even self numbers are accepted (known gaps, docs §1.3)", (t) => {
+test("task-614: a decision cannot declare that it replaces itself, and the write rolls back", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const old1 = dataOf(store.createDecision(p.projectId, { decision: "old ruling" }));
+  const rowsBefore = store.database.prepare("SELECT count(*) AS n FROM decisions").get().n;
+  // The next insert takes max(id)+1, so claiming that number is a self-reference.
+  const selfNumber = store.database.prepare("SELECT max(id) + 1 AS next FROM decisions").get().next;
+  const single = store.createDecision(p.projectId, { decision: "replaces itself", replaces: [selfNumber] });
+  errorOf(single, "VALIDATION_FAILED");
+  assert.equal(single.error.field, "replaces");
+  assert.match(single.error.message, /replaces itself/i);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, rowsBefore, "the row was rolled back, not left half-written");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions WHERE replaces_json IS NOT NULL").get().n, 0);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_revisions").get().n, 0);
+
+  // Batch: the self-referencing row is reported with its one-based index and the
+  // whole batch still commits nothing.
+  const batchSelfNumber = store.database.prepare("SELECT max(id) + 1 AS next FROM decisions").get().next;
+  const beforeBatch = store.database.prepare("SELECT count(*) AS n FROM decisions").get().n;
+  const batch = store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "self in batch", replaces: [batchSelfNumber] },
+    { decision: "innocent row" },
+  ] });
+  errorOf(batch, "VALIDATION_FAILED");
+  assert.equal(batch.error.field, "replaces");
+  assert.equal(batch.error.itemIndex, 1);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, beforeBatch, "no row survives the aborted batch");
+
+  // Normal replaces is untouched: the new record carries the declaration, the
+  // replaced records keep revision, status and updatedAt, and no snapshot exists.
+  const oldState = dataOf(store.getDecision(p.projectId, { decisionId: old1.decisionId }));
+  const newer = dataOf(store.createDecision(p.projectId, { decision: "new ruling", replaces: [old1.decisionId] }));
+  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: newer.decisionId })).replaces, [old1.decisionId]);
+  const oldAfter = dataOf(store.getDecision(p.projectId, { decisionId: old1.decisionId }));
+  assert.equal(oldAfter.revision, 1);
+  assert.equal(oldAfter.status, "effective");
+  assert.equal(oldAfter.replaces, null);
+  assert.equal(oldAfter.updatedAt, oldState.updatedAt);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decision_revisions").get().n, 0);
+  // A batch that replaces earlier records (not itself) still works.
+  const batchOk = dataOf(store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "batch replaces old", replaces: [old1.decisionId] },
+  ] }));
+  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: batchOk.decisions[0].decisionId })).replaces, [old1.decisionId]);
+});
+
+test("task-609: replaces is a declaration — unknown numbers are still accepted; self numbers were fixed by task-614", (t) => {
   const store = storeFor(t);
   const p = project(store);
   dataOf(store.createDecision(p.projectId, { decision: "seed" }));
@@ -784,23 +830,18 @@ test("task-609: replaces is a declaration — unknown and even self numbers are 
   assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: unknown.decisionId })).replaces, [99999]);
   assert.equal(store.getDecision(p.projectId, { decisionId: 99999 }).error.code, "DECISION_NOT_FOUND");
 
-  // Gap 2: nothing rejects a number that is about to BE this row's own id, so a
-  // decision can declare that it replaces itself. Pinned so a future fix (or a
-  // deliberate non-fix) is visible; if the store starts rejecting this, delete
-  // this assertion and update docs §1.3.
-  const rowsBefore = store.database.prepare("SELECT count(*) AS n FROM decisions").get().n;
-  const selfNumber = rowsBefore + 1;
-  const self = dataOf(store.createDecision(p.projectId, { decision: "replaces itself", replaces: [selfNumber] }));
-  assert.equal(self.decisionId, selfNumber, "the next id is exactly the number it claimed to replace");
-  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: self.decisionId })).replaces, [selfNumber]);
+  // Gap 2 was fixed by task-614; its fixture is "task-614: a decision cannot
+  // declare that it replaces itself" — kept out of here on purpose, so a mutation
+  // of that check reds exactly one test.
 
   // Gap 3: "who superseded this decision" has no query face — replaces is
   // write-only apart from being echoed on get, and update cannot change it.
   const searchBySuccessor = store.searchDecisions(p.projectId, { replacedBy: 1 });
   errorOf(searchBySuccessor, "VALIDATION_FAILED");
   assert.equal(searchBySuccessor.error.field, "replacedBy");
+  const target = dataOf(store.createDecision(p.projectId, { decision: "a real record" }));
   const patchReplaces = store.updateDecision(p.projectId, {
-    decisionId: self.decisionId,
+    decisionId: target.decisionId,
     expectedRevision: 1,
     patch: { replaces: [1] },
   });

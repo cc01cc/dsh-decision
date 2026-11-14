@@ -1426,6 +1426,7 @@ export class SQLiteDecisionStore {
       if (isExternalIdUniqueError(error)) {
         return validationFailure("externalId", "External id already exists in this Profile database.");
       }
+      if (error instanceof SelfReplaceError) return validationFailure("replaces", error.message);
       return sqliteFailure(error);
     }
   }
@@ -1492,6 +1493,7 @@ export class SQLiteDecisionStore {
               }),
             });
           } catch (error) {
+            if (error instanceof SelfReplaceError) throw new RowConstraintError(index + 1, "replaces");
             const constraintField = decisionConstraintField(error);
             if (constraintField === undefined) throw error;
             throw new RowConstraintError(index + 1, constraintField);
@@ -1882,6 +1884,8 @@ export class SQLiteDecisionStore {
       ],
     );
     const decisionId = toSafeId(result.lastInsertRowid);
+    // task-614 (609 G2): now that the id exists, reject a self-replacement.
+    if (input.replaces !== undefined && input.replaces.includes(decisionId)) throw new SelfReplaceError();
     // Typed reference edges are part of the same write transaction; a decision
     // and its refs commit together (requirements §10.3).
     if (input.refs !== undefined && input.refs.length > 0) {
@@ -1921,6 +1925,25 @@ export class SQLiteDecisionStore {
 function isForeignKeyError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /FOREIGN KEY constraint failed/i.test(message);
+}
+
+/**
+ * task-614 (609 G2): a decision may not declare that it replaces itself.
+ *
+ * A self-reference is meaningless ("this record supersedes itself") and puts a
+ * self-loop in the supersession graph, so it is rejected rather than stored.
+ * The row's own id only exists after the INSERT, so the check runs there and
+ * throws: transaction() then rolls the whole write back, which keeps the batch
+ * contract ("any failure leaves nothing behind") and lets the batch map the
+ * failure onto a one-based itemIndex like any other row constraint.
+ */
+class SelfReplaceError extends Error {
+  readonly field = "replaces";
+
+  constructor() {
+    super("A decision must not declare that it replaces itself.");
+    this.name = "SelfReplaceError";
+  }
 }
 
 // Frozen contract: errors attributable to one batch row carry a one-based
