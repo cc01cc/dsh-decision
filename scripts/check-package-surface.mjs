@@ -169,7 +169,12 @@ function main(argv) {
         process.stdout.write(JSON.stringify({ root, ok: missingTotal === 0, missingTotal, packages: reports }, null, 2) + "\n");
     } else if (missingTotal === 0) {
         for (const report of reports) {
-            process.stdout.write("[check-package-surface] " + report.name + ": " + report.declaredCount + " 个声明目标全部存在\n");
+            process.stdout.write(
+                "[check-package-surface] " + report.name + ": " +
+                    (report.declaredCount === 0
+                        ? "没有任何发布面声明（无可校验目标）\n"
+                        : report.declaredCount + " 个声明目标全部存在\n"),
+            );
         }
     } else {
         for (const report of reports) {

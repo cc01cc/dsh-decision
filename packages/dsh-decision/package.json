@@ -7,22 +7,7 @@
   "engines": {
     "node": ">=24"
   },
-  "exports": {
-    "./typert": {
-      "types": "./lib/typert.host.d.ts",
-      "default": "./lib/typert.host.js"
-    },
-    "./client/typert": {
-      "types": "./lib/typert.client.d.ts",
-      "default": "./lib/typert.client.js"
-    }
-  },
-  "files": [
-    "lib/typert.host.d.ts",
-    "lib/typert.host.js",
-    "lib/typert.client.d.ts",
-    "lib/typert.client.js"
-  ],
+  "files": [],
   "scripts": {
     "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/storage/timestamp-order.test.mjs tests/host/config.test.mjs tests/host/caller.test.mjs tests/host/binding.test.mjs tests/host/first-binding.test.mjs tests/host/tools.test.mjs tests/scripts/ledger-fixtures.test.mjs",
     "test:executor": "node --test tests/executor/executor-matrix.test.mjs",

@@ -229,7 +229,7 @@
 | TTY 正向样本 | **未取得**：本会话三种情形 `isTTY` 全为 `null`（Agent 通道无控制台）⇒ 「TTY 可用来区分人与非人」只有负向读数 |
 | 跨用户 ACL 拒绝 | **只读了 ACL**（无 `Authenticated Users`），**未用第二个账户实机验证**「真的被拒」 |
 | PPID 伪造 | **未成功复现**（`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 两次 `err=87`）⇒ **本文不主张「父链可被伪造」**；否决候选 B 只依赖方向层 + 脱链层 |
-| Typert 生成 / `lib/` 产出 | **仍未被任何人执行**：`lib/` 实测 **0 文件**，`package.json` 无 build script ⇒ 插件「从源码到可安装产物」这一步仍是空的（热更证明的是**运行时组合**，不是**打包产物**） |
+| Typert 生成 / `lib/` 产出 | **仍未被任何人执行**：`lib/` 实测 **0 文件**，`package.json` 无 build script ⇒ 插件「从源码到可安装产物」这一步仍是空的（热更证明的是**运行时组合**，不是**打包产物**）。**（task-89 更新）** 指向 `lib/typert.*` 的两条 `exports` 与四条 `files` 已**撤回**——它们是从未实现过的前向声明，`pnpm pack` 实测只打出一个 `package.json`（total files: 1，零警告）；产出由 [`PLAN-0780`](../../../plans/PLAN-0780-DSD-typed-remote/README.md) T3.5 承接，撤声明不等于放弃该目标 |
 | `question-asker` 的 `pending` 语义 | 在自然 CLI 里**测不到**（不传超时则永不到达）；只有显式传 `projectTimeoutMs` 才能到达并返回 `PROJECT_REQUIRED` 且零写入 |
 | 独立 profile 的三类理由（§1.2） | **未实测**，是允许使用的工程理由清单，不是已证实的收益 |
 
