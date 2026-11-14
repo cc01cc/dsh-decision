@@ -165,8 +165,17 @@ function collectEntries(strict = false) {
         flush();
         // 多号展开只认标题起首的并列枚举（D-802 / D-803 / …）；
         // 标题里被修订/引用/撤销的 D 号不是并列条目（防跨条正文污染）。
-        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[\/、,，]\s*`?D-\d+)*)/);
-        const rawIds = enumMatch ? [...enumMatch[1].matchAll(/D-(\d+)/g)].map((m) => m[0]) : ["D-" + h[2]];
+        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[\/、,，～~]\s*`?D-\d+)*)/);
+        // 区间形态「D-13 ～ D-16」= 13..16 全部成员（不只是两个端点）。
+        let rawIds;
+        if (enumMatch) {
+          const range = enumMatch[1].match(/^D-(\d+)\s*[～~]\s*D-(\d+)$/);
+          rawIds = range
+            ? Array.from({ length: Number(range[2]) - Number(range[1]) + 1 }, (_, k) => "D-" + (Number(range[1]) + k))
+            : [...enumMatch[1].matchAll(/D-(\d+)/g)].map((m) => m[0]);
+        } else {
+          rawIds = ["D-" + h[2]];
+        }
         const uniqueRaw = [...new Set(rawIds)];
         const uniqueDnums = uniqueRaw.map((s) => Number(s.slice(2)));
         if (uniqueDnums.length > 1) multiNumberHeadings += 1;
@@ -215,8 +224,12 @@ function collectEntries(strict = false) {
         return;
       }
       if (current) {
+        // 表格行也是条目边界：标题/项目符号条目正文里跟的表格，其 D 行是
+        // 独立条目（卷A「## D-13 ～ D-16」后 66 行成员表曾是静默丢失源，
+        // task-480 后由 D-1383 实测：吞进 heading 正文再被丢弃）。
         const boundary = RE.nextEntry.test(line) || sectionRe.test(line)
-          || (current.kind === "bullet" && /^-\s/.test(line));
+          || (current.kind === "bullet" && /^-\s/.test(line))
+          || RE.row.test(line);
         if (boundary) { flush(); }
         else { current.bodyLines.push(line); return; }
       }
@@ -298,6 +311,10 @@ function buildDecision(entry, indexMeta) {
       rationale = cells[3] || null;
       dateText = cells.map((c) => c.match(RE.date)?.[1]).find(Boolean) ?? null;
       if (!decision) reasons.push("定义行决策格为空");
+      // 行条目若被并入后续补条（mergeInto 写入 bodyLines），内容必须并进
+      // decision，不能静默丢弃（D-13 曾丢 23K 的先例）。
+      const merged = (entry.bodyLines ?? []).join("\n").trim();
+      if (merged) decision = decision ? decision + "\n" + merged : merged;
     }
   }
   if (dateText === null && meta?.date) dateText = meta.date;

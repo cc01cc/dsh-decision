@@ -108,7 +108,9 @@ function independentInventory() {
         flush(); cur = { dnums: [d], kind: "bold" }; continue;
       }
       if (cur) {
-        const boundary = /^#{2,4}\s+`?D-\d+/.test(line) || /^##\s+(?!.*`?D-\d)/.test(line) || (cur.kind === "bullet" && /^-\s/.test(line));
+        const boundary = /^#{2,4}\s+`?D-\d+/.test(line) || /^##\s+(?!.*`?D-\d)/.test(line)
+          || (cur.kind === "bullet" && /^-\s/.test(line))
+          || /^\|\s*`?D-\d+`?\s*\|/.test(line); // 表格行也是条目边界
         if (boundary) flush(); else continue;
       }
       const r = line.match(/^\|\s*`?D-(\d+)`?\s*\|/);
