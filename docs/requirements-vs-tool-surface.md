@@ -32,7 +32,7 @@
 >
 > **四条判据均已绿；剩下的问题都不是「没做」，而是「做成了声明语义」**（G1/G3：`refs`/`replaces` 的**目标**不解析、不能反查；G2 自引用已由 `task-614` 关掉）—— 形态与最小修法见 §1.3，不要在下一张卡里重做实现。
 >
-> 另外，`G3` 的「谁取代了它」反查已作为**新增能力**落地（`task-615`，schema v3，`search{replacedDecisionId}` + 列表项 `replaces`），设计见 [`replaces-reverse-lookup-design.md`](replaces-reverse-lookup-design.md) —— 它不是四条需求之一，是老账本读者要的第二方向。
+> 另外，`G3` 的「谁取代了它」反查已作为**新增能力**落地（`task-615`，`7a695386`，schema v3，`search{replacedDecisionId}` + 列表项 `replaces`），设计见 [`replaces-reverse-lookup-design.md`](replaces-reverse-lookup-design.md) —— 它不是四条需求之一，是老账本读者要的第二方向。
 >
 > 下表「现状」列是 2026-11-13 的快照，**已作废**，只看历史价值。
 
@@ -112,7 +112,7 @@ node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/
 | --- | --- | --- | --- | --- |
 | G1 | `refs` 的目标不解析：不存在或别的项目的 key 照样写入 | `refs:[{task,T-NOT-EXIST}]` ⇒ 接受；`get` 回显该边；反向查询 `{task,T-NOT-EXIST}` 仍命中；`{decision,99999}`（本库无此决策）同样接受 | 写时校验目标存在且同项目 | **建议不修**：账本迁移需要前向引用（被引用的 task 可能后到）。文档口径：「有下游 task」= **声明了 task 边**，不等于该 task 在本库存在 |
 | G2 | ~~`replaces` 不防自引用~~ | **已修（`task-614`，`670c2bf2`）**：`replaces:[本行自己的 id]` ⇒ `VALIDATION_FAILED / field: replaces`，整笔回滚（单条行数不变；批内 `itemIndex 1`、整批 0 行）；`replaces:[99999]` 仍接受（G1 的前向引用，不动） | 已按最小修法落地：insert 后比对 `decisionId ∈ replaces` ⇒ 抛错回滚（`SelfReplaceError`） | **已修**；变异去掉该检查 ⇒ 只红 `task-614` 那一条夹具（sha 为提交后回填：`670c2bf2`） |
-| G3 | ~~没有「谁取代了它」的反查~~ | **已实现（`task-615`）**：`search{replacedDecisionId: X}` ⇒ 返回声明取代 X 的决策；未命中返回空数组（不是报错）；列表项新增 `replaces`。设计取舍见 [`replaces-reverse-lookup-design.md`](replaces-reverse-lookup-design.md) | 已落地：`decision_replaces` 投影表 + `idx_decision_replaces_reverse(replaced_id, decision_id)`；schema v3；`EXPLAIN QUERY PLAN` = `SEARCH decision_replaces USING COVERING INDEX idx_decision_replaces_reverse (replaced_id=?)` | **已实现（schema v3）**；`created_at` 取声明方自己的建立时间，不是迁移时刻 |
+| G3 | ~~没有「谁取代了它」的反查~~ | **已实现（`task-615`，`7a695386`）**：`search{replacedDecisionId: X}` ⇒ 返回声明取代 X 的决策；未命中返回空数组（不是报错）；列表项新增 `replaces`。设计取舍见 [`replaces-reverse-lookup-design.md`](replaces-reverse-lookup-design.md) | 已落地：`decision_replaces` 投影表 + `idx_decision_replaces_reverse(replaced_id, decision_id)`；schema v3；`EXPLAIN QUERY PLAN` = `SEARCH decision_replaces USING COVERING INDEX idx_decision_replaces_reverse (replaced_id=?)` | **已实现（schema v3）**；`created_at` 取声明方自己的建立时间，不是迁移时刻 |
 | G4 | `update` 不能改 `replaces`/`externalId` | `patch.replaces` ⇒ `VALIDATION_FAILED / field: patch.replaces` | 同 §1.2 `externalId`：声明只能建时给 | **不修（既定口径）**；建记录时没声明，之后补不了 |
 
 **夹具与变异（判据与缺口都有看守，且变异只红对应用例）**
