@@ -1,6 +1,6 @@
 # DSD 需求 ↔ 六工具面 对齐表
 
-> **状态**：~~对照结论（无实现改动）~~ **已被 2026-11-14 复核取代** —— 当时判「完全不存在」的 4 条**已全部实现**，见 [§1.1](#11-2026-11-14-复核4-条全部已实现task-592-复核产出) · **原日期**：2026-11-13（`task-330`）· **复核**：2026-11-14（`task-592`）
+> **状态**：~~对照结论（无实现改动）~~ **已被 2026-11-14 复核取代** —— 当时判「完全不存在」的 4 条**已全部实现**，见 [§1.1](#11-2026-11-14-复核4-条全部已实现task-592-复核产出) · **原日期**：2026-11-13（`task-330`）· **复核**：2026-11-14（`task-592`）· **收口**：同 11-14 `task-600`（§1.2 `external_id` 行为契约）与 `task-609`（§1.3 反向查询 / `time_scope`+`replaces` 三态复核）
 > **对照对象**：`internal/A03-xihe/docs/dsd-decision-requirements.md`（用户经 Lead 转交的需求清单，XH 侧维护）
 > **对照面**：本仓六个工具 + 存储层 schema（`packages/dsh-decision/src`）
 > **证据等级**：`[源码]` 读代码得 / `[实测]` 本机跑得（复算方式见 §5）/ `[推断]` 由前两者推论，未单独验证
@@ -28,6 +28,12 @@
 
 ## 1. 现行口径：§11 保留的 4 条（权威表）
 
+> **四条现状一句话（2026-11-14 `task-609` 收口，读这里就够了）**：① 外部幂等键 `external_id` **已实现**（大小写/零填充不折叠，含首尾空白的键直接拒；跨项目命中回执带归属）；② `refs` 类型与方向约束 **已实现**（`bl` 写反方向被拒）；③ 反向查询 **已实现**（`decision_get` 答「这条决策有没有下游 task」，`search{refType,refId}` 答「谁引用了 X」，不需要告警进程）；④ `time_scope` **默认长期** + 默认列表按临时/长期分别列出 + `replaces` 声明 **已实现**。
+>
+> **四条判据均已绿；剩下的问题都不是「没做」，而是「做成了声明语义」**（refs / replaces 的目标不解析、不校验）—— 形态与最小修法见 §1.3，不要在下一张卡里重做实现。
+>
+> 下表「现状」列是 2026-11-13 的快照，**已作废**，只看历史价值。
+
 | # | 需求原文（不改写意思） | 现状 | 锚点 | 证据等级 | 实现顺序建议 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 「`create` 接受**外部幂等键** `external_id`（我们给 `D-1120` / `BL-584`）」；判据：同一 `external_id` 重复 create ⇒ 返回已存在，不新建第二条 | **完全不存在** | `decisions` 表 15 列无该列（`sqlite-store.ts:333-362`，`PRAGMA table_info` 实测）；create 参数表（`host/tools.ts:305-318`）无该字段；传入即被拒：`VALIDATION_FAILED / Unknown field / field: externalId` 实测 ⇒ 不是「忽略」，是**显式拒绝** | `[源码]` + `[实测]` | **1（最先）**。改动面 = 一列 + 唯一索引 + create 与 create_batch 两处入参 + 一条仓储查重。**注意**：`decision_create_batch` 一次 ≤100 条且「全成功或全回滚」⇒ 848 行要 9 批，**批间中断仍会重复**，所以幂等键必须在批内与批间都生效 |
@@ -53,6 +59,15 @@
 **§1 #1 的 NULL 语义（卡面要求「显式决定并写进卡面」）** —— 现状已成事实，且是**允许**：
 
 > **未传 `external_id` 的记录允许多条**（唯一索引把 NULL 视为互不相等）。决策已由 `d4765ab` 落地并在工具描述里明说：`CREATE_BATCH_DESCRIPTION`（`tools.ts:408-410`）「Rows without externalId are not deduplicated — do not re-submit them blindly.」实测：连建 5 条不带键的记录 ⇒ `external_id IS NULL` 行数 7（含前序），无报错。
+
+**复核口径**：本次 `[实测]` 用一次性探针（`.tmp/dsd-592/probe*.mjs`，不入 git，建系统临时库、用完即删），全部直连 `src/storage/sqlite-store.ts`（Node 24 类型剥离，零构建）。**复算命令**：
+
+```
+cd A12-DSH-decision/packages/dsh-decision
+node --test tests/storage/decision-ops.test.mjs tests/storage/sqlite-store.test.mjs tests/host/tools.test.mjs
+```
+
+读数：**86 / 86 绿，exit 0**（含 5 条 `T377` 专项）。变异自证：把 `createDecision` 的外部键查重整段删掉 ⇒ 上述套件 **4 红**（`T377: decision_create dedupes…`、`create with externalId…`、`dedupe returns the existing record's current revision…`、`external_id uniqueness spans projects…`）⇒ 幂等键**有夹具看守**，不是只靠读数。
 
 ### 1.2 `external_id` 行为契约（2026-11-14 task-600 收口）
 
@@ -80,14 +95,31 @@ node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/
 
 读数：**88 / 88 绿**（三个受影响文件；含 `task-600 ①` 与 `task-600: the tool face …` 两条新夹具；整包 `pnpm test` 148 / 148 绿）。变异自证：删掉首尾空白校验 ⇒ 只红 `task-600 ①`；删掉 `existingProjectId` ⇒ 只红 `external_id uniqueness spans projects…`（报「cross-project hit names the owning project」）。
 
-**复核口径**：本次 `[实测]` 用一次性探针（`.tmp/dsd-592/probe*.mjs`，不入 git，建系统临时库、用完即删），全部直连 `src/storage/sqlite-store.ts`（Node 24 类型剥离，零构建）。**复算命令**：
+### 1.3 反向查询 / `time_scope`+`replaces` 三态复核（2026-11-14 `task-609` 复核产出）
 
-```
-cd A12-DSH-decision/packages/dsh-decision
-node --test tests/storage/decision-ops.test.mjs tests/storage/sqlite-store.test.mjs tests/host/tools.test.mjs
-```
+**结论：两条都判「已实现」**，判据在 HEAD `6d29e2c` 上实跑为绿；缺的不是实现，而是**「声明」没有被解析**（见下方缺口表）。逐条给读数，避免下一张卡再按 §1 快照派活。
 
-读数：**86 / 86 绿，exit 0**（含 5 条 `T377` 专项）。变异自证：把 `createDecision` 的外部键查重整段删掉 ⇒ 上述套件 **4 红**（`T377: decision_create dedupes…`、`create with externalId…`、`dedupe returns the existing record's current revision…`、`external_id uniqueness spans projects…`）⇒ 幂等键**有夹具看守**，不是只靠读数。
+| # | 判据 | 三态 | 锚点 | 实跑读数 |
+| --- | --- | --- | --- | --- |
+| 3 | 任意决策能答「有没有下游 task」，且不需要告警守护进程 | **已实现** | 正向（决策自己的边）`getDecision` 读 `decision_refs` `sqlite-store.ts:1523-1529`；反向（谁引用了 X）`searchDecisions` 子查询 `:1550-1556`、入参 `:551-584`；索引 `idx_decision_refs_reverse(ref_type, ref_key)`；工具面 `tools.ts:357-365`、`:386-387` | 有 task 边的决策 ⇒ `refs` 含 `{task,T-194}`、`hasTask true`；无边的 ⇒ `refs: []`、`hasTask false`（空数组而非 null，存在/不存在都答得出）。反向：`{refType:"task",refId:"T-194"}` ⇒ 命中 1 条；不存在的 key ⇒ `[]` + `hasMore false`（不是报错）；半坐标 ⇒ `VALIDATION_FAILED`「refType and refId must be provided together」；`refType:"bl"` ⇒ 方向规则拒（`field: refType`）。访问路径 `EXPLAIN QUERY PLAN`：`SEARCH decision_refs USING INDEX idx_decision_refs_reverse (ref_type=? AND ref_key=?)`。跨项目不串（别的项目的同 key 边不出现） |
+| 4 | `time_scope` 默认长期；默认列表能分开列「临时/长期」；新条能声明取代谁 | **已实现** | 默认值 `sqlite-store.ts:436`（`buildInsertItem`）+ 列默认 `:891`；列表与筛选 `:1546-1549`、`:1578`；`replaces` 列 `:836-842`、`:903`、写入 `:1881`、读回 `:728`、入参 `tools.ts:331-335` | 不传 `timeHorizon`：单条与批内都 ⇒ `long_term`；显式 `temporary` ⇒ 覆盖成功；显式 `null` ⇒ `field: timeHorizon` 拒（不强制转换）。默认列表：`search({})` 返回全部（无需关键词），项键 = `decisionId / preview / status / timeHorizon / externalId`；`{timeHorizon:"temporary"}` ⇒ 只临时条、`{timeHorizon:"long_term"}` ⇒ 只长期条，非法值 ⇒ `field: timeHorizon`。`replaces: [old1, old2]` ⇒ 新条 `get` 返回 `[old1, old2]`；**旧条 `revision`/`status`/`updatedAt` 全不变、`replaces` 仍 `null`、`decision_revisions` 0 行**（「写在新条上，旧条不改」如实成立） |
+
+**缺口表（都是「声明未被解析」，不是判据未达；不要当缺陷派人重做实现）**
+
+| # | 缺口 | 现状读数 | 最小修法 | 形态 |
+| --- | --- | --- | --- | --- |
+| G1 | `refs` 的目标不解析：不存在或别的项目的 key 照样写入 | `refs:[{task,T-NOT-EXIST}]` ⇒ 接受；`get` 回显该边；反向查询 `{task,T-NOT-EXIST}` 仍命中；`{decision,99999}`（本库无此决策）同样接受 | 写时校验目标存在且同项目 | **建议不修**：账本迁移需要前向引用（被引用的 task 可能后到）。文档口径：「有下游 task」= **声明了 task 边**，不等于该 task 在本库存在 |
+| G2 | `replaces` 不解析、不防自引用 | `replaces:[99999]` 接受；**`replaces:[下一行自己的 id]` 也接受** ⇒ 一条决策能声明「取代自己」（实测该新行 id 恰等于所声明的数字） | insert 后比对 `decisionId ∈ replaces` 并回滚 | **建议修**（约 5 行 + 1 夹具），但属新增行为 ⇒ 需裁定，不在本卡 |
+| G3 | 没有「谁取代了它」的反查 | `search{replacedBy: id}` ⇒ `VALIDATION_FAILED / Unknown field`；列表项不含 `replaces` ⇒ 不知道 id 就看不到后继 | 建 `decision_replaces(decision_id, replaced_id)` 关联表 + 反查参数 | 新增能力，另开卡（与 G1 同源：把声明变成边） |
+| G4 | `update` 不能改 `replaces`/`externalId` | `patch.replaces` ⇒ `VALIDATION_FAILED / field: patch.replaces` | 同 §1.2 `externalId`：声明只能建时给 | **不修（既定口径）**；建记录时没声明，之后补不了 |
+
+**夹具与变异（判据与缺口都有看守，且变异只红对应用例）**
+
+- 新增两条：`decision-ops.test.mjs` 的 `task-609: the reverse query is served by idx_decision_refs_reverse…`（索引列序 + 访问路径 + refs 声明语义）、`task-609: replaces is a declaration…`（G2/G3/G4 的钉子，注释写明「若哪天开始拒绝自引用，删这条断言并改本节」）。
+- 变异读数：默认值 `long_term`→`temporary` ⇒ **7 红**（含 `omitting timeHorizon defaults to long_term`）；删反向子查询 ⇒ **5 红**（含 `search refType/refId is the reverse query…`）；`replaces` 不写入 ⇒ **3 红**；反向索引改单列 ⇒ **只红** `task-609` 索引夹具。
+- 第二层护栏：把整条反向索引删掉 ⇒ **store 开库即失败**（`assertSchemaShape` `sqlite-store.ts:1047`「Database is missing one or more required decision-store indexes.」），不是静默降级成扫表。
+
+**复算**：命令同 §1.1（三个文件）。本卡新增两条夹具后读数 **90 / 90 绿**，整包 `pnpm test` **150 / 150 绿**；§1.2 记的 88/88、§1.1 记的 86/86 是各自当时的读数，保留原样以便追溯。
 
 ---
 

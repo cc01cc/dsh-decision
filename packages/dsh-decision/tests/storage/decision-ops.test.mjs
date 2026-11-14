@@ -772,6 +772,46 @@ test("replaces is a declaration: a not-yet-existing number is accepted and reada
   assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: created.decisionId })).replaces, [99999]);
 });
 
+test("task-609: replaces is a declaration — unknown and even self numbers are accepted (known gaps, docs §1.3)", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  dataOf(store.createDecision(p.projectId, { decision: "seed" }));
+  // Gap 1: the target is never resolved, so a number outside this database is
+  // stored verbatim. This is deliberate for the ledger import (the replaced
+  // decision may arrive later), but it also means a typo is indistinguishable
+  // from a forward reference.
+  const unknown = dataOf(store.createDecision(p.projectId, { decision: "replaces an unknown number", replaces: [99999] }));
+  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: unknown.decisionId })).replaces, [99999]);
+  assert.equal(store.getDecision(p.projectId, { decisionId: 99999 }).error.code, "DECISION_NOT_FOUND");
+
+  // Gap 2: nothing rejects a number that is about to BE this row's own id, so a
+  // decision can declare that it replaces itself. Pinned so a future fix (or a
+  // deliberate non-fix) is visible; if the store starts rejecting this, delete
+  // this assertion and update docs §1.3.
+  const rowsBefore = store.database.prepare("SELECT count(*) AS n FROM decisions").get().n;
+  const selfNumber = rowsBefore + 1;
+  const self = dataOf(store.createDecision(p.projectId, { decision: "replaces itself", replaces: [selfNumber] }));
+  assert.equal(self.decisionId, selfNumber, "the next id is exactly the number it claimed to replace");
+  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: self.decisionId })).replaces, [selfNumber]);
+
+  // Gap 3: "who superseded this decision" has no query face — replaces is
+  // write-only apart from being echoed on get, and update cannot change it.
+  const searchBySuccessor = store.searchDecisions(p.projectId, { replacedBy: 1 });
+  errorOf(searchBySuccessor, "VALIDATION_FAILED");
+  assert.equal(searchBySuccessor.error.field, "replacedBy");
+  const patchReplaces = store.updateDecision(p.projectId, {
+    decisionId: self.decisionId,
+    expectedRevision: 1,
+    patch: { replaces: [1] },
+  });
+  errorOf(patchReplaces, "VALIDATION_FAILED");
+  assert.equal(patchReplaces.error.field, "patch.replaces");
+  // The list items do not carry replaces either, so a successor is invisible
+  // unless the caller already knows its id.
+  const list = dataOf(store.searchDecisions(p.projectId, {}));
+  assert.equal("replaces" in list.decisions[0], false);
+});
+
 test("the default list separates temporary from long_term without a keyword", (t) => {
   const store = storeFor(t);
   const p = project(store);
@@ -977,6 +1017,36 @@ test("the reverse filter requires both coordinates and validates refId", (t) => 
   const withQuery = store.searchDecisions(p.projectId, { query: "seed", refType: "task" });
   errorOf(withQuery, "VALIDATION_FAILED");
   assert.equal(withQuery.error.field, "refId");
+});
+
+test("task-609: the reverse query is served by idx_decision_refs_reverse, and refs are declarations", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  // The declared access path: (ref_type, ref_key), in that order — the reverse
+  // filter binds both coordinates, so an index on either alone would full-scan.
+  const index = store.database.prepare("SELECT sql FROM sqlite_master WHERE name = 'idx_decision_refs_reverse'").get();
+  assert.match(index.sql, /decision_refs\s*\(\s*ref_type\s*,\s*ref_key\s*\)/, "the reverse index keeps both coordinates in order");
+  const plan = store.database.prepare(
+    "EXPLAIN QUERY PLAN SELECT id FROM decisions WHERE project_id = ? AND id IN (SELECT decision_id FROM decision_refs WHERE ref_type = ? AND ref_key = ?)",
+  ).all(1, "task", "T-194").map((row) => row.detail);
+  const reversePlan = plan.find((detail) => /decision_refs/.test(detail)) ?? "";
+  assert.ok(
+    /idx_decision_refs_reverse/.test(reversePlan) && /ref_type=\?/.test(reversePlan) && /ref_key=\?/.test(reversePlan),
+    "the reverse subquery must use the reverse index on BOTH coordinates: " + JSON.stringify(plan),
+  );
+  assert.ok(!plan.some((detail) => /SCAN decision_refs/.test(detail)), "no full scan of the edge table");
+
+  // refs are DECLARATIONS: a target that does not exist is still a written edge,
+  // so "has a downstream task" means "declared a task edge", not "that task is in
+  // this database". Documented as a known gap in docs §1.3.
+  const declared = dataOf(store.createDecision(p.projectId, {
+    decision: "declares a downstream task that this database does not hold",
+    refs: [{ type: "task", id: "T-NOT-EXIST" }],
+  }));
+  const got = dataOf(store.getDecision(p.projectId, { decisionId: declared.decisionId }));
+  assert.deepEqual(got.refs, [{ type: "task", id: "T-NOT-EXIST" }]);
+  const reverse = dataOf(store.searchDecisions(p.projectId, { refType: "task", refId: "T-NOT-EXIST" }));
+  assert.deepEqual(reverse.decisions.map((d) => d.decisionId), [declared.decisionId]);
 });
 
 test("refs are add-only after create (task-405 evolves task-393): update/void keep them, snapshots exclude them", (t) => {
