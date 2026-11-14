@@ -472,6 +472,8 @@ test("T377: tool schemas expose the extension fields and keep bl out of the enum
 
   const batchParams = byName.get("decision_create_batch").parameters;
   assert.ok(batchParams.decisions.items.properties.externalId !== undefined);
+  const batchData = byName.get("decision_create_batch").output.schema.properties.data;
+  assert.ok(batchData.properties.decisions.items.properties.existingProjectId !== undefined);
 
   const searchParams = byName.get("decision_search").parameters;
   assert.notEqual(searchParams.query.required, true, "query is optional: omission lists");
@@ -480,11 +482,40 @@ test("T377: tool schemas expose the extension fields and keep bl out of the enum
   const createData = byName.get("decision_create").output.schema.properties.data;
   assert.ok(createData.properties.externalId !== undefined);
   assert.ok(createData.properties.alreadyExisted !== undefined);
+  // task-600 ③: the ownership marker is declared, not only emitted.
+  assert.ok(createData.properties.existingProjectId !== undefined);
+  assert.equal(createData.properties.existingProjectId.description.includes("DIFFERENT project"), true);
   const getData = byName.get("decision_get").output.schema.properties.data;
   assert.ok(getData.properties.externalId !== undefined);
   assert.ok(getData.properties.replaces !== undefined);
   const searchData = byName.get("decision_search").output.schema.properties.data;
   assert.ok(searchData.properties.decisions.items.properties.timeHorizon !== undefined);
+});
+
+test("task-600: the tool face rejects a padded key and marks a key owned by another project", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const padded = await invoke(create, root, { decision: "padded", externalId: " D-1120" });
+  assert.equal(padded.value.ok, false, JSON.stringify(padded.value));
+  assert.equal(padded.value.error.code, "VALIDATION_FAILED");
+  assert.equal(padded.value.error.field, "externalId");
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0);
+
+  // A decision owned by another project: session-377 is bound to project 1.
+  const other = store.createProject({ name: "Borealis", projectKey: "borealis" });
+  assert.equal(other.ok, true, JSON.stringify(other));
+  const theirs = store.createDecision(other.data.projectId, { decision: "owned elsewhere", externalId: "BL-584" });
+  assert.equal(theirs.ok, true, JSON.stringify(theirs));
+  const hit = await invoke(create, root, { decision: "mine", externalId: "BL-584" });
+  assert.equal(hit.value.ok, true, JSON.stringify(hit.value));
+  assert.equal(hit.value.data.alreadyExisted, true);
+  assert.equal(hit.value.data.existingProjectId, other.data.projectId, "the tool face says whose key it is");
+  assert.equal(hit.value.data.decisionId, theirs.data.decisionId);
+
+  const mineAgain = await invoke(create, root, { decision: "mine", externalId: "DSD-1" });
+  assert.equal(mineAgain.value.ok, true, JSON.stringify(mineAgain.value));
+  assert.equal("existingProjectId" in mineAgain.value.data, false, "a same-project create carries no marker");
 });
 
 // --------------------------------------------------- task-393 refs-of surface

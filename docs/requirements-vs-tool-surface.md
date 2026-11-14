@@ -54,6 +54,32 @@
 
 > **未传 `external_id` 的记录允许多条**（唯一索引把 NULL 视为互不相等）。决策已由 `d4765ab` 落地并在工具描述里明说：`CREATE_BATCH_DESCRIPTION`（`tools.ts:408-410`）「Rows without externalId are not deduplicated — do not re-submit them blindly.」实测：连建 5 条不带键的记录 ⇒ `external_id IS NULL` 行数 7（含前序），无报错。
 
+### 1.2 `external_id` 行为契约（2026-11-14 task-600 收口）
+
+四条**已落地的语义**，读代码时不要按常识补：
+
+| 语义 | 行为 | 锚点 |
+| --- | --- | --- |
+| **不规范化** | 键**按原样存**：不 trim、不折叠大小写、不补零。`D-1120` / `d-1120` / `D-01120` 是**三个不同的键**（各建一行、互不去重）。 | `parseExternalId` `sqlite-store.ts:261-284` |
+| **拒绝首尾空白** | 含首尾空白的键 ⇒ `VALIDATION_FAILED / field: externalId`，消息点名 whitespace。**不做静默 trim** —— trim 会把两个不同输入折成同一身份（零强制转换纪律）。批内同规则，整批回滚。 | 同上；校验函数 `startsOrEndsWithContractWhitespace` |
+| **不做规范化是有意的** | 键是本工作区的**工作项号**（`D-1120` / `BL-584`），由人/脚本给出；折叠大小写或补零等于替调用方猜身份。宁可拒，不可猜。 | 同上 |
+| **NULL 允许多条** | 未传 `external_id` 的记录**不受唯一约束**（SQLite 唯一索引视 NULL 互不相等）⇒ 可多条；批内不去重。已写进工具描述 `tools.ts:408-410`。 | `uq_decisions_external_id` `sqlite-store.ts:884` |
+
+**唯一性边界 = 整个 Profile 库（跨项目），且失败必须说出来。** 键是工作区工作项号，天然全局，因此唯一性不收窄到项目级；代价是「B 项目用 A 项目的键」时返回的是 A 的记录。**回执必须能区分这种命中**：跨项目命中带 `existingProjectId`（同项目命中不带该字段），因为返回的 `decisionId` 在 B 项目里 `getDecision` 读不到 —— 不带这个字段时回执看起来就是一次普通成功（task-600 ③）。
+
+**已知限制（不支持先建后补键）**：`update`/patch **不能**设置 `externalId`（`patch.externalId` ⇒ `VALIDATION_FAILED / Unknown field`），即建记录时没带键，之后**无法补**。理由：唯一迁移路径 `scripts/migrate-ledger.mjs:336` 创建即带键，存量不受影响；把「补键」加进去属于新增能力（需要处理键冲突与修订语义），单独立卡，不在 2026-11-14 这批。
+
+**残余（已知，不修）**：拒绝首尾空白发生在**输入边界**（`parseCreateExtensions` / 批内逐项），DB 层 CHECK 只保证「非全空白 + 1–200 码点 + 无 NUL」。要在 DB 层禁止首尾空白需要重建表（SQLite 不能 ALTER CHECK）⇒ 要 schema v3，代价与收益不成比例：写入面只有 `create`/`create_batch` 两个入口，都过同一个解析器。
+
+**复算**：
+
+```
+cd A12-DSH-decision/packages/dsh-decision
+node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/storage/sqlite-store.test.mjs
+```
+
+读数：**88 / 88 绿**（三个受影响文件；含 `task-600 ①` 与 `task-600: the tool face …` 两条新夹具；整包 `pnpm test` 148 / 148 绿）。变异自证：删掉首尾空白校验 ⇒ 只红 `task-600 ①`；删掉 `existingProjectId` ⇒ 只红 `external_id uniqueness spans projects…`（报「cross-project hit names the owning project」）。
+
 **复核口径**：本次 `[实测]` 用一次性探针（`.tmp/dsd-592/probe*.mjs`，不入 git，建系统临时库、用完即删），全部直连 `src/storage/sqlite-store.ts`（Node 24 类型剥离，零构建）。**复算命令**：
 
 ```

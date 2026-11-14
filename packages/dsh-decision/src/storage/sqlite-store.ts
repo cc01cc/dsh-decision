@@ -103,6 +103,12 @@ export interface DecisionCreateReceipt {
   /** Present only when the input carried externalId: true means an existing
    * record was returned instead of creating a duplicate (requirements §10.2). */
   alreadyExisted?: boolean;
+  /** task-600 ③: present only when the deduplicated record lives in a DIFFERENT
+   * project of this Profile database. Its presence is the whole point: the
+   * external key is a workspace-wide work-item number, so a caller in project B
+   * may own nothing, and the returned decisionId is NOT readable from B. Without
+   * this field the receipt looked like a plain success. */
+  existingProjectId?: number;
 }
 
 export interface DecisionBatchReceipt {
@@ -116,6 +122,8 @@ export interface DecisionBatchReceipt {
     revision: number;
     externalId?: string;
     alreadyExisted?: boolean;
+    /** task-600 ③: see DecisionCreateReceipt.existingProjectId. */
+    existingProjectId?: number;
   }>;
 }
 
@@ -178,6 +186,8 @@ interface ExistingDecisionTarget {
   summary: string | null;
   status: DecisionStatus;
   createdAt: string;
+  /** task-600 ③: owner project, so a cross-project hit can say so. */
+  projectId: number;
 }
 
 interface RevisionRow {
@@ -258,6 +268,14 @@ function isBlankContract(value: string): boolean {
   return Array.from(value).every((char) => CONTRACT_WHITE_SPACE.test(char));
 }
 
+/** task-600 ①: whitespace at either end is rejected, never trimmed. Trimming
+ * would silently fold two different inputs into one identity, and the key is
+ * supposed to be an exact work-item number (D-1120 / BL-584). */
+function startsOrEndsWithContractWhitespace(value: string): boolean {
+  const chars = Array.from(value);
+  return CONTRACT_WHITE_SPACE.test(chars[0]!) || CONTRACT_WHITE_SPACE.test(chars[chars.length - 1]!);
+}
+
 function parseExternalId(value: unknown): DomainResult<string> {
   if (typeof value !== "string") {
     return validationFailure("externalId", "Expected a string of 1–200 code points; omit the field instead of passing null.");
@@ -266,6 +284,12 @@ function parseExternalId(value: unknown): DomainResult<string> {
   const length = Array.from(value).length;
   if (length < 1 || length > 200) return validationFailure("externalId", "Expected 1–200 Unicode code points.");
   if (isBlankContract(value)) return validationFailure("externalId", "Must not be blank.");
+  if (startsOrEndsWithContractWhitespace(value)) {
+    return validationFailure(
+      "externalId",
+      "Must not begin or end with whitespace; the key is stored exactly as given (no trimming, no case folding, no zero padding).",
+    );
+  }
   return { ok: true, data: value };
 }
 
@@ -713,12 +737,20 @@ function targetOfRow(row: DecisionRow): ExistingDecisionTarget {
     summary: row.summary,
     status: row.status,
     createdAt: row.createdAt,
+    projectId: row.projectId,
   };
 }
 
 /** The receipt returned when an external_id already exists (requirements
- * §10.2): the caller receives the EXISTING record's identity, not a new row. */
-function receiptForExisting(target: ExistingDecisionTarget, externalId: string): DecisionCreateReceipt {
+ * §10.2): the caller receives the EXISTING record's identity, not a new row.
+ * requestProjectId decides the ownership marker (task-600 ③): a hit inside the
+ * caller's own project is a plain dedupe; a hit in another project adds
+ * existingProjectId, because that decisionId cannot be read from here. */
+function receiptForExisting(
+  target: ExistingDecisionTarget,
+  externalId: string,
+  requestProjectId: number,
+): DecisionCreateReceipt {
   return {
     decisionId: target.decisionId,
     revision: target.revision,
@@ -727,6 +759,7 @@ function receiptForExisting(target: ExistingDecisionTarget, externalId: string):
     createdAt: target.createdAt,
     externalId,
     alreadyExisted: true,
+    ...(target.projectId === requestProjectId ? {} : { existingProjectId: target.projectId }),
   };
 }
 
@@ -1379,7 +1412,7 @@ export class SQLiteDecisionStore {
             [item.externalId],
           );
           if (existing !== undefined) {
-            return { ok: true, data: receiptForExisting(targetOfRow(existing), item.externalId) };
+            return { ok: true, data: receiptForExisting(targetOfRow(existing), item.externalId, projectId.data) };
           }
         }
         return { ok: true, data: this.insertDecision(projectId.data, item) };
@@ -1433,7 +1466,7 @@ export class SQLiteDecisionStore {
             let receipt: DecisionCreateReceipt;
             const target = item.externalId === undefined ? undefined : targets.get(item.externalId);
             if (target !== undefined) {
-              receipt = receiptForExisting(target, item.externalId!);
+              receipt = receiptForExisting(target, item.externalId!, projectId.data);
             } else {
               receipt = this.insertDecision(projectId.data, item);
               createdCount += 1;
@@ -1444,6 +1477,7 @@ export class SQLiteDecisionStore {
                   summary: receipt.summary,
                   status: receipt.status,
                   createdAt: receipt.createdAt,
+                  projectId: projectId.data,
                 });
               }
             }
@@ -1454,6 +1488,7 @@ export class SQLiteDecisionStore {
               ...(item.externalId === undefined ? {} : {
                 externalId: item.externalId,
                 alreadyExisted: receipt.alreadyExisted === true,
+                ...(receipt.existingProjectId === undefined ? {} : { existingProjectId: receipt.existingProjectId }),
               }),
             });
           } catch (error) {

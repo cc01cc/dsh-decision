@@ -391,6 +391,29 @@ test("external_id uniqueness spans projects inside one Profile database", (t) =>
   assert.equal(other.decisionId, first.decisionId, "the ledger key identifies one record Profile-wide");
   assert.equal(other.alreadyExisted, true);
   assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 1);
+  // task-600 ③: the cross-project hit must SAY it belongs elsewhere — otherwise
+  // project B gets an id it cannot read and reads the receipt as a success.
+  assert.equal(other.existingProjectId, a.projectId, "cross-project hit names the owning project");
+  assert.equal(
+    store.getDecision(b.projectId, { decisionId: other.decisionId }).error.code,
+    "DECISION_NOT_FOUND",
+    "and that id really is unreadable from B",
+  );
+  // Same-project dedupe stays a plain dedupe: no ownership field at all.
+  const sameAgain = dataOf(store.createDecision(a.projectId, { decision: "in atlas again", externalId: "D-77" }));
+  assert.equal(sameAgain.decisionId, first.decisionId);
+  assert.equal(sameAgain.alreadyExisted, true);
+  assert.equal(other.existingProjectId !== undefined && sameAgain.existingProjectId === undefined, true);
+  assert.equal("existingProjectId" in sameAgain, false, "same-project receipt keeps its original shape");
+  // Batch path carries the same marker.
+  const c = project(store, "Cetus", "cetus");
+  const batch = dataOf(store.createDecisionsBatch(c.projectId, { decisions: [
+    { decision: "mine", externalId: "C-1" },
+    { decision: "theirs", externalId: "D-77" },
+  ] }));
+  assert.equal(batch.createdCount, 1);
+  assert.equal(batch.decisions[0].existingProjectId, undefined);
+  assert.equal(batch.decisions[1].existingProjectId, a.projectId);
 });
 
 test("create without externalId keeps exactly the frozen receipt shape", (t) => {
@@ -417,6 +440,35 @@ test("invalid externalId values are rejected with field externalId and write not
   // 200 code points is the accepted upper bound (counted in code points).
   const ok = dataOf(store.createDecision(p.projectId, { decision: "ok", externalId: "🐉".repeat(200) }));
   assert.equal(ok.externalId, "🐉".repeat(200));
+});
+
+test("task-600 ①: an externalId with leading/trailing whitespace is rejected, never trimmed", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  // 五写法各一次：前空格 / 后空格 / 前后都有 / 制表符 / 全角空格(U+3000)。
+  const padded = [" D-1120", "D-1120 ", " D-1120 ", "\tD-1120", "D-1120\u3000"];
+  for (const value of padded) {
+    const result = store.createDecision(p.projectId, { decision: "ok", externalId: value });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "externalId", JSON.stringify(value));
+    assert.match(result.error.message, /whitespace/i, JSON.stringify(value));
+  }
+  // 批内同样拒绝，且整批回滚（不留半条）。
+  const batch = store.createDecisionsBatch(p.projectId, { decisions: [
+    { decision: "fine", externalId: "D-1120" },
+    { decision: "padded", externalId: "D-1120 " },
+  ] });
+  errorOf(batch, "VALIDATION_FAILED");
+  assert.equal(batch.error.field, "externalId");
+  assert.equal(batch.error.itemIndex, 2);
+  assert.equal(store.database.prepare("SELECT count(*) AS n FROM decisions").get().n, 0, "nothing was written");
+
+  // 无空白键照常通过；「看起来像」的不同写法仍是不同键（不折叠大小写/不补零）。
+  assert.equal(dataOf(store.createDecision(p.projectId, { decision: "clean", externalId: "D-1120" })).externalId, "D-1120");
+  for (const shape of ["d-1120", "D-01120"]) {
+    const receipt = dataOf(store.createDecision(p.projectId, { decision: "distinct " + shape, externalId: shape }));
+    assert.equal(receipt.alreadyExisted, false, shape + " must stay a distinct key (no folding, no zero padding)");
+  }
 });
 
 test("batch dedupes within one batch and across batches after an interrupted run", (t) => {

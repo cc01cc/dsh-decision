@@ -316,7 +316,7 @@ function sharedDecisionParameters(): Record<string, SchemaNode> {
     decisionDate: prop(NULLABLE, false, "Calendar date YYYY-MM-DD, or null."),
     reviewDate: prop(NULLABLE, false, "Calendar date YYYY-MM-DD, or null; never triggers a status change."),
     sourceReference: prop(NULLABLE, false, "Up to 4,000 code points of plain text; never an identity or id mapping."),
-    externalId: prop(STRING, false, "Optional external idempotency key (e.g. a ledger id like D-1120), 1–200 code points. Repeating create with the same externalId returns the existing record instead of creating a duplicate; uniqueness spans the whole Profile database. Omit it when there is no external key."),
+    externalId: prop(STRING, false, "Optional external idempotency key (e.g. a ledger id like D-1120), 1–200 code points, stored exactly as given: leading/trailing whitespace is rejected (never trimmed), and case or zero padding is never folded. Repeating create with the same externalId returns the existing record instead of creating a duplicate; uniqueness spans the whole Profile database, so a key created in another project is reported with existingProjectId instead of being created here. Omit it when there is no external key."),
     refs: prop(
       {
         type: "array",
@@ -400,13 +400,13 @@ const GET_PARAMETERS: Record<string, SchemaNode> = {
 
 /** decision_create (contract lines 179-210). */
 const CREATE_DESCRIPTION =
-"Save one decision in the current session's project, only when the user explicitly asked for it. The required field is the decision content itself — do not invent a title. Fill summary only when a short summary genuinely helps. When the decision has an external ledger id, pass it as externalId: repeating the create with the same externalId returns the existing record (alreadyExisted true) instead of creating a duplicate. Never pass a source number or project number; use the returned DSD number afterwards.";
+"Save one decision in the current session's project, only when the user explicitly asked for it. The required field is the decision content itself — do not invent a title. Fill summary only when a short summary genuinely helps. When the decision has an external ledger id, pass it as externalId: repeating the create with the same externalId returns the existing record (alreadyExisted true) instead of creating a duplicate. If that key already belongs to ANOTHER project in this Profile database, the receipt also carries existingProjectId and the returned decisionId is not readable here — do not report it as a create in this project. Never pass a source number or project number; use the returned DSD number afterwards.";
 
 const CREATE_PARAMETERS = sharedDecisionParameters();
 
 /** decision_create_batch (contract lines 212-256). */
 const CREATE_BATCH_DESCRIPTION =
-"Save several decisions you have already organised, only when the user explicitly asked for them, each with the same fields as decision_create. One successful call commits the whole batch; any validation or write failure leaves nothing behind. Rows carrying an externalId are idempotent: a row whose key already exists (including one created earlier in the same batch) is returned as alreadyExisted instead of duplicated, so a batch interrupted mid-run can be re-submitted safely. Rows without externalId are not deduplicated — do not re-submit them blindly.";
+"Save several decisions you have already organised, only when the user explicitly asked for them, each with the same fields as decision_create. One successful call commits the whole batch; any validation or write failure leaves nothing behind. Rows carrying an externalId are idempotent: a row whose key already exists (including one created earlier in the same batch) is returned as alreadyExisted instead of duplicated, so a batch interrupted mid-run can be re-submitted safely. Rows without externalId are not deduplicated — do not re-submit them blindly. A row whose key belongs to ANOTHER project comes back with existingProjectId and is not readable from this project.";
 
 const CREATE_BATCH_PARAMETERS: Record<string, SchemaNode> = {
   decisions: prop(
@@ -490,6 +490,7 @@ const CREATE_DATA: SchemaNode = objectNode({
   createdAt: prop(STRING, true, "Creation timestamp."),
   externalId: prop(STRING, false, "Echoed only when the input carried externalId."),
   alreadyExisted: prop({ type: "boolean" }, false, "Present only when the input carried externalId: true means an existing record was returned instead of creating a duplicate."),
+  existingProjectId: prop(INTEGER, false, "Present only when the deduplicated record belongs to a DIFFERENT project of this Profile database. The returned decisionId is then not readable from the current project — treat it as \"this key already belongs elsewhere\", not as a create in this project."),
 });
 
 const CREATE_BATCH_DATA: SchemaNode = objectNode({
@@ -503,6 +504,7 @@ const CREATE_BATCH_DATA: SchemaNode = objectNode({
         revision: prop(INTEGER, true, "1 for a new record; the existing record's revision when alreadyExisted is true."),
         externalId: prop(STRING, false, "Echoed only when the row carried externalId."),
         alreadyExisted: prop({ type: "boolean" }, false, "Present only when the row carried externalId: true means an existing record was returned."),
+        existingProjectId: prop(INTEGER, false, "Present only when the deduplicated row belongs to a DIFFERENT project; that decisionId is not readable from the current project."),
       }),
     },
     true,
