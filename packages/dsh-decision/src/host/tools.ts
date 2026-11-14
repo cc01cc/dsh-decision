@@ -477,7 +477,11 @@ const SEARCH_DATA: SchemaNode = objectNode({
         status: prop({ type: "string", enum: [...STATUS] }, true, "effective or voided."),
         timeHorizon: prop({ type: "string", enum: [...HORIZON] }, true, "long_term or temporary."),
         externalId: prop(NULLABLE, true, "External id (e.g. ledger D number) when set, else null; identifies hits without a follow-up get."),
-        replaces: prop({ type: "array", items: INTEGER }, true, "The decisions this record declares it replaces; null when it declares none."),
+        replaces: prop(
+          { oneOf: [{ type: "array", items: INTEGER }, { type: "null" }] },
+          true,
+          "The decisions this record declares it replaces, or null when it declares none (same shape as decision_get: a list hit without replaces is null, not an empty array).",
+        ),
         refTypes: prop(
           {
             type: "array",
