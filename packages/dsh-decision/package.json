@@ -25,7 +25,8 @@
   ],
   "scripts": {
     "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/storage/timestamp-order.test.mjs tests/host/config.test.mjs tests/host/caller.test.mjs tests/host/binding.test.mjs tests/host/first-binding.test.mjs tests/host/tools.test.mjs tests/scripts/ledger-fixtures.test.mjs",
-    "test:executor": "node --test tests/executor/executor-matrix.test.mjs"
+    "test:executor": "node --test tests/executor/executor-matrix.test.mjs",
+    "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
