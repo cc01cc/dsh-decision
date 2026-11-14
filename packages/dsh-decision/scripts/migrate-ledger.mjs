@@ -222,16 +222,18 @@ function collectEntries(strict = false) {
           current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
           return;
         }
-        flush();
+        // 附记是「侧插」：直接落 raw 交给第二遍并入，**不动 current** ——
+        // 否则宿主条目在附记之后的正文会被并进附记那个号（task-491 回归，dsd-1 实测
+        // main:3734：D-1046 的执行条款被并进 D-1044）。
         adjunctEntries += 1;
         const rest = ba[4].replace(/^[：:]\s*/, "").trim();
-        current = {
+        raw.push({
           dnum, dnums: [dnum], extId: ba[1], extIds: [ba[1]],
           kind: "adjunct", file: src.label, line: lineNo,
           headingLine: line,
           title: ba[3].trim(),
           bodyLines: rest ? [rest] : [],
-        };
+        });
         return;
       }
       const bo = strict ? null : line.match(RE.bold);
@@ -294,7 +296,9 @@ function collectEntries(strict = false) {
   const mergeInto = (prev, entry) => {
     const fragment = entry.kind === "row"
       ? ["", entry.cells.join(" | ")]
-      : ["", entry.headingLine, ...entry.bodyLines];
+      : entry.kind === "adjunct"
+        ? ["", entry.headingLine] // 附记整行已含正文，bodyLines 是其子串，再并一遍就是纯重复
+        : ["", entry.headingLine, ...entry.bodyLines];
     prev.bodyLines = (prev.bodyLines ?? []).concat(fragment);
     prev.merged = (prev.merged ?? []).concat([{ file: entry.file, line: entry.line }]);
   };
