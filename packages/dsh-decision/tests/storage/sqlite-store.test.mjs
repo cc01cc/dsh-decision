@@ -111,11 +111,11 @@ test("requires an explicit absolute file path and never creates parent directori
   assert.equal(existsSync(paths.databasePath), false);
 });
 
-test("initializes five tables, named indexes, user_version, and required connection pragmas", (t) => {
+test("initializes six tables, named indexes, user_version, and required connection pragmas", (t) => {
   const { store } = storeFor(t);
   const database = store.database;
 
-  assert.equal(pragma(database, "user_version"), 2);
+  assert.equal(pragma(database, "user_version"), 3);
   assert.equal(String(pragma(database, "journal_mode")).toLowerCase(), "wal");
   assert.equal(pragma(database, "busy_timeout"), 5000);
   assert.equal(pragma(database, "foreign_keys"), 1);
@@ -126,7 +126,7 @@ test("initializes five tables, named indexes, user_version, and required connect
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
       (statement) => statement.all().map((row) => row.name),
     ),
-    ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"],
+    ["decision_refs", "decision_replaces", "decision_revisions", "decisions", "projects", "session_projects"],
   );
   const indexes = withStatement(database,
     "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -142,6 +142,8 @@ test("initializes five tables, named indexes, user_version, and required connect
     "uq_decisions_external_id",
     "uq_decision_refs_edge",
     "idx_decision_refs_reverse",
+    "uq_decision_replaces_edge",
+    "idx_decision_replaces_reverse",
   ]) assert.ok(indexes.includes(index), `missing index ${index}`);
   const schemaSql = withStatement(database,
     "SELECT sql FROM sqlite_master WHERE type = 'table'",
@@ -156,7 +158,7 @@ test("initializes five tables, named indexes, user_version, and required connect
   const strictSupported = Number(sqliteVersion.split(".")[0]) > 3
     || (Number(sqliteVersion.split(".")[0]) === 3 && Number(sqliteVersion.split(".")[1]) >= 37);
   assert.equal(strictSupported, true, `unexpected SQLite version ${sqliteVersion}`);
-  for (const table of ["projects", "session_projects", "decisions", "decision_revisions", "decision_refs"]) {
+  for (const table of ["projects", "session_projects", "decisions", "decision_revisions", "decision_refs", "decision_replaces"]) {
     assert.match(schemaSql, new RegExp(`CREATE TABLE \\b${table}\\b ([\\s\\S]*?)\\)\\s*STRICT`, "i"));
   }
   for (const constraint of [
@@ -562,8 +564,8 @@ test("schema preflight rejects incompatible DELETE-mode files without changing p
   assertPreservedAfterRefusal(
     foreignKeyViolation.databasePath,
     /foreign key violations/i,
-    2,
-    ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"],
+    3,
+    ["decision_refs", "decision_replaces", "decision_revisions", "decisions", "projects", "session_projects"],
     "SELECT session_id AS value FROM session_projects LIMIT 1",
   );
 });
@@ -613,7 +615,7 @@ function dumpV1Rows(database) {
   };
 }
 
-test("v1 database migrates to v2 in place, preserving every stored row", (t) => {
+test("v1 database migrates to v3 in place, preserving every stored row", (t) => {
   const paths = tempPath();
   const seed = seedV1Database(paths.databasePath);
   const before = dumpV1Rows(seed);
@@ -623,19 +625,25 @@ test("v1 database migrates to v2 in place, preserving every stored row", (t) => 
   t.after(() => store.close());
   const database = store.database;
 
-  assert.equal(pragma(database, "user_version"), 2, "open migrates v1 to v2");
+  assert.equal(pragma(database, "user_version"), 3, "open migrates v1 straight to v3 (one transaction)");
   assert.deepEqual(
     withStatement(database,
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
       (statement) => statement.all().map((row) => row.name),
     ),
-    ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"],
+    ["decision_refs", "decision_replaces", "decision_revisions", "decisions", "projects", "session_projects"],
   );
   const indexes = withStatement(database,
     "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     (statement) => statement.all().map((row) => row.name),
   );
-  for (const index of ["uq_decisions_external_id", "uq_decision_refs_edge", "idx_decision_refs_reverse"]) {
+  for (const index of [
+    "uq_decisions_external_id",
+    "uq_decision_refs_edge",
+    "idx_decision_refs_reverse",
+    "uq_decision_replaces_edge",
+    "idx_decision_replaces_reverse",
+  ]) {
     assert.ok(indexes.includes(index), `missing migrated index ${index}`);
   }
   assert.deepEqual(dumpV1Rows(database), before, "migration must not rewrite any stored v1 row");
@@ -649,7 +657,7 @@ test("v1 database migrates to v2 in place, preserving every stored row", (t) => 
   // Reopening a migrated database does not migrate again.
   const reopened = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
   try {
-    assert.equal(pragma(reopened.database, "user_version"), 2);
+    assert.equal(pragma(reopened.database, "user_version"), 3);
     assert.deepEqual(dumpV1Rows(reopened.database), before);
   } finally {
     reopened.close();
@@ -675,6 +683,96 @@ test("v1 database migrates to v2 in place, preserving every stored row", (t) => 
   const again = dataOf(store.createDecision(1, { decision: "duplicate attempt", externalId: "D-9001" }));
   assert.equal(again.decisionId, created.decisionId);
   assert.equal(again.alreadyExisted, true);
+  // task-615: a v1 file has no replaces declaration, so the v2->v3 backfill adds
+  // nothing; a post-migration create then writes the projection in the same
+  // transaction as the declaration.
+  const projection = withStatement(database,
+    "SELECT decision_id, replaced_id FROM decision_replaces ORDER BY decision_id, replaced_id",
+    (statement) => statement.all().map((row) => [row.decision_id, row.replaced_id]),
+  );
+  assert.deepEqual(projection, [[created.decisionId, 1]], "only the newly declared edge is in the projection");
+  const reverse = dataOf(store.searchDecisions(1, { replacedDecisionId: 1 }));
+  assert.deepEqual(reverse.decisions.map((d) => d.decisionId), [created.decisionId]);
+});
+
+test("v2 database migrates to v3 and backfills decision_replaces from the authority", (t) => {
+  const paths = tempPath();
+  // Build a v3 database first (the only writer that can seed replaces), then
+  // strip exactly what v2->v3 adds and set the version back to 2. The v2->v3
+  // migration is additive only (one table + two indexes), so this reproduces the
+  // v2 shape faithfully; the pre-v3 store binary is not available here, and the
+  // real v1 fixture above covers the "genuine old file" path.
+  const seedStore = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
+  seedStore.createProject({ name: "Atlas", projectKey: "atlas" });
+  const oldA = dataOf(seedStore.createDecision(1, { decision: "old A" }));
+  const oldB = dataOf(seedStore.createDecision(1, { decision: "old B" }));
+  const newer = dataOf(seedStore.createDecision(1, {
+    decision: "newer ruling",
+    replaces: [oldA.decisionId, oldB.decisionId],
+  }));
+  seedStore.close();
+
+  const raw = new DatabaseSync(paths.databasePath);
+  raw.exec("PRAGMA foreign_keys = OFF");
+  raw.exec(`
+    DROP INDEX uq_decision_replaces_edge;
+    DROP INDEX idx_decision_replaces_reverse;
+    DROP TABLE decision_replaces;
+    PRAGMA user_version = 2;
+  `);
+  raw.close();
+
+  const store = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
+  t.after(() => store.close());
+  const database = store.database;
+  assert.equal(pragma(database, "user_version"), 3, "a v2 file upgrades to v3 on open");
+  const pairs = withStatement(database,
+    "SELECT decision_id, replaced_id, created_at FROM decision_replaces ORDER BY decision_id, replaced_id",
+    (statement) => statement.all(),
+  );
+  assert.deepEqual(
+    pairs.map((row) => [row.decision_id, row.replaced_id]),
+    [[newer.decisionId, oldA.decisionId], [newer.decisionId, oldB.decisionId]],
+    "the projection is backfilled from replaces_json",
+  );
+  assert.equal(pairs[0].created_at, newer.createdAt, "backfill keeps the declarer's own created_at, not the migration time");
+  // The authority is untouched by the migration.
+  assert.deepEqual(dataOf(store.getDecision(1, { decisionId: newer.decisionId })).replaces, [oldA.decisionId, oldB.decisionId]);
+  // And the reverse query works against the backfilled rows.
+  const hits = dataOf(store.searchDecisions(1, { replacedDecisionId: oldA.decisionId }));
+  assert.deepEqual(hits.decisions.map((d) => d.decisionId), [newer.decisionId]);
+});
+
+test("a v2 file with an unexpected shape is refused before any ALTER", (t) => {
+  const paths = tempPath();
+  const seedStore = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
+  seedStore.createProject({ name: "Atlas", projectKey: "atlas" });
+  dataOf(seedStore.createDecision(1, { decision: "old" }));
+  seedStore.close();
+
+  const raw = new DatabaseSync(paths.databasePath);
+  // Reproduce the v2 shape (additive-only migration), then remove one index v2
+  // must have: the file is now "v2 by number, not v2 by shape".
+  raw.exec(`DROP INDEX uq_decision_replaces_edge; DROP INDEX idx_decision_replaces_reverse; DROP TABLE decision_replaces; PRAGMA user_version = 2;`);
+  raw.exec("DROP INDEX idx_decision_refs_reverse");
+  raw.close();
+
+  assert.throws(
+    () => SQLiteDecisionStore.open({ databasePath: paths.databasePath }),
+    /missing one or more required decision-store indexes/i,
+  );
+  const after = new DatabaseSync(paths.databasePath);
+  try {
+    assert.equal(pragma(after, "user_version"), 2, "the refused open did not move the version");
+    assert.equal(
+      after.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'decision_replaces'").get().n,
+      0,
+      "nothing was created on a foreign file",
+    );
+    assert.equal(after.prepare("SELECT count(*) AS n FROM decisions").get().n, 1, "stored rows untouched");
+  } finally {
+    after.close();
+  }
 });
 
 test("a failed v1 migration rolls back completely and leaves the file at v1", (t) => {

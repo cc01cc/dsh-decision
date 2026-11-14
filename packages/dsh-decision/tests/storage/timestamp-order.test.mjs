@@ -66,12 +66,12 @@ test("existing rows keep their stored updatedAt across reopen (no re-migration)"
   try {
     const after = ids.map((id) => dataOf(reopened.getDecision(p.projectId, { decisionId: id })).updatedAt);
     assert.deepEqual(after, before, "updatedAt must not be rewritten on reopen");
-    assert.equal(reopened.database.prepare("PRAGMA user_version").get().user_version, 2, "schema version unchanged");
+    assert.equal(reopened.database.prepare("PRAGMA user_version").get().user_version, 3, "schema version unchanged");
     const columns = reopened.database.prepare("SELECT name FROM pragma_table_info('decisions') ORDER BY cid").all().map((row) => row.name);
     assert.deepEqual(columns, ["id", "revision", "project_id", "decision_text", "summary", "rationale",
       "time_horizon", "decision_date", "review_date", "status", "void_reason", "voided_at",
       "source_reference", "created_at", "updated_at", "external_id", "replaces_json"],
-    "task-377 appended exactly two columns; none was renamed");
+    "task-377 appended exactly two columns and task-615 added none (v3 adds a table, not a decisions column); none was renamed");
   } finally { reopened.close(); cleanup(root); }
 });
 

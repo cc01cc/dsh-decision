@@ -32,6 +32,8 @@
 >
 > **四条判据均已绿；剩下的问题都不是「没做」，而是「做成了声明语义」**（G1/G3：`refs`/`replaces` 的**目标**不解析、不能反查；G2 自引用已由 `task-614` 关掉）—— 形态与最小修法见 §1.3，不要在下一张卡里重做实现。
 >
+> 另外，`G3` 的「谁取代了它」反查已作为**新增能力**落地（`task-615`，schema v3，`search{replacedDecisionId}` + 列表项 `replaces`），设计见 [`replaces-reverse-lookup-design.md`](replaces-reverse-lookup-design.md) —— 它不是四条需求之一，是老账本读者要的第二方向。
+>
 > 下表「现状」列是 2026-11-13 的快照，**已作废**，只看历史价值。
 
 | # | 需求原文（不改写意思） | 现状 | 锚点 | 证据等级 | 实现顺序建议 |
@@ -109,8 +111,8 @@ node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/
 | # | 缺口 | 现状读数 | 最小修法 | 形态 |
 | --- | --- | --- | --- | --- |
 | G1 | `refs` 的目标不解析：不存在或别的项目的 key 照样写入 | `refs:[{task,T-NOT-EXIST}]` ⇒ 接受；`get` 回显该边；反向查询 `{task,T-NOT-EXIST}` 仍命中；`{decision,99999}`（本库无此决策）同样接受 | 写时校验目标存在且同项目 | **建议不修**：账本迁移需要前向引用（被引用的 task 可能后到）。文档口径：「有下游 task」= **声明了 task 边**，不等于该 task 在本库存在 |
-| G2 | ~~`replaces` 不防自引用~~ | **已修（`task-614`）**：`replaces:[本行自己的 id]` ⇒ `VALIDATION_FAILED / field: replaces`，整笔回滚（单条行数不变；批内 `itemIndex 1`、整批 0 行）；`replaces:[99999]` 仍接受（G1 的前向引用，不动） | 已按最小修法落地：insert 后比对 `decisionId ∈ replaces` ⇒ 抛错回滚（`SelfReplaceError`） | **已修**；变异去掉该检查 ⇒ 只红 `task-614` 那一条夹具 |
-| G3 | 没有「谁取代了它」的反查 | `search{replacedBy: id}` ⇒ `VALIDATION_FAILED / Unknown field`；列表项不含 `replaces` ⇒ 不知道 id 就看不到后继 | 建 `decision_replaces(decision_id, replaced_id)` 关联表 + 反查参数 | 新增能力，另开卡（与 G1 同源：把声明变成边） |
+| G2 | ~~`replaces` 不防自引用~~ | **已修（`task-614`，`670c2bf2`）**：`replaces:[本行自己的 id]` ⇒ `VALIDATION_FAILED / field: replaces`，整笔回滚（单条行数不变；批内 `itemIndex 1`、整批 0 行）；`replaces:[99999]` 仍接受（G1 的前向引用，不动） | 已按最小修法落地：insert 后比对 `decisionId ∈ replaces` ⇒ 抛错回滚（`SelfReplaceError`） | **已修**；变异去掉该检查 ⇒ 只红 `task-614` 那一条夹具（sha 为提交后回填：`670c2bf2`） |
+| G3 | ~~没有「谁取代了它」的反查~~ | **已实现（`task-615`）**：`search{replacedDecisionId: X}` ⇒ 返回声明取代 X 的决策；未命中返回空数组（不是报错）；列表项新增 `replaces`。设计取舍见 [`replaces-reverse-lookup-design.md`](replaces-reverse-lookup-design.md) | 已落地：`decision_replaces` 投影表 + `idx_decision_replaces_reverse(replaced_id, decision_id)`；schema v3；`EXPLAIN QUERY PLAN` = `SEARCH decision_replaces USING COVERING INDEX idx_decision_replaces_reverse (replaced_id=?)` | **已实现（schema v3）**；`created_at` 取声明方自己的建立时间，不是迁移时刻 |
 | G4 | `update` 不能改 `replaces`/`externalId` | `patch.replaces` ⇒ `VALIDATION_FAILED / field: patch.replaces` | 同 §1.2 `externalId`：声明只能建时给 | **不修（既定口径）**；建记录时没声明，之后补不了 |
 
 **夹具与变异（判据与缺口都有看守，且变异只红对应用例）**
@@ -119,7 +121,9 @@ node --test tests/storage/decision-ops.test.mjs tests/host/tools.test.mjs tests/
 - 变异读数：默认值 `long_term`→`temporary` ⇒ **7 红**（含 `omitting timeHorizon defaults to long_term`）；删反向子查询 ⇒ **5 红**（含 `search refType/refId is the reverse query…`）；`replaces` 不写入 ⇒ **3 红**；反向索引改单列 ⇒ **只红** `task-609` 索引夹具。
 - 第二层护栏：把整条反向索引删掉 ⇒ **store 开库即失败**（`assertSchemaShape` `sqlite-store.ts:1047`「Database is missing one or more required decision-store indexes.」），不是静默降级成扫表。
 
-**复算**：命令同 §1.1（三个文件）。本卡新增两条夹具后读数 **90 / 90 绿**，整包 `pnpm test` **150 / 150 绿**；§1.2 记的 88/88、§1.1 记的 86/86 是各自当时的读数，保留原样以便追溯。
+**复算**：命令同 §1.1（三个文件；`task-615` 另加 `tests/storage/timestamp-order.test.mjs`）。**当前读数 99 / 99 绿**（四个文件），整包 `pnpm test` **155 / 155 绿**；§1.3 首版记的 90/90、§1.2 的 88/88、§1.1 的 86/86 都是各自当时的读数，保留原样以便追溯。
+
+**`task-615` 的变异读数**：去掉投影写入 ⇒ 3 红（两条 `task-615` 夹具 + v1 升级夹具）；去掉反向过滤 ⇒ 4 红；反查索引改成非覆盖（只 `replaced_id`）⇒ **只红** `task-615` 存储夹具（`COVERING INDEX` 断言）；回填改成写“今天” ⇒ **只红** v2→v3 回填夹具（`created_at` 断言）。
 
 ---
 

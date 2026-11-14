@@ -377,7 +377,7 @@ const DECISION_RECORD: SchemaNode = objectNode({
 
 /** decision_search (contract lines 110-143). */
 const SEARCH_DESCRIPTION =
-"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring by default: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards. For a multi-word question pass queryMode 'keywords': the query is split on whitespace and every token must match (AND), each token still a literal substring — use it instead of guessing one exact phrase.";
+"Find decisions in the current session's project by keyword, or omit query to list recent decisions (the default list). Filter timeHorizon to list temporary and long-term decisions separately. Provide refType and refId together for the reverse query: only decisions referencing that external key are returned. To answer \"has this decision been superseded?\", pass replacedDecisionId: only decisions that declare they replace that number are returned. Returns compact hits only; call decision_get with the DSD number for full content. Matching is a literal substring by default: ASCII letters are case-insensitive, non-ASCII matches by code point, and % or _ are not wildcards. For a multi-word question pass queryMode 'keywords': the query is split on whitespace and every token must match (AND), each token still a literal substring — use it instead of guessing one exact phrase.";
 
 const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
   query: prop(STRING, false, "1–500 code points, not blank; an empty string is rejected. Omit query to list recent decisions in recency order (the default list). Searches summary, decision, rationale and source reference."),
@@ -385,6 +385,7 @@ const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
   timeHorizon: prop({ type: "string", enum: [...HORIZON] }, false, "Restrict results to long_term or temporary; use it to list the two horizons separately."),
   refType: prop({ type: "string", enum: [...DECISION_REF_TYPES] }, false, "Reverse query: only decisions referencing this type of item. Provide together with refId; bl is not a valid type (direction rule)."),
   refId: prop(STRING, false, "Reverse query: external key of the referenced item (e.g. T-194, D-1119, a commit sha), 1–200 code points. Provide together with refType; answers which decisions reference this key."),
+  replacedDecisionId: prop(INTEGER, false, "Reverse supersession: return the decisions that declare they replace this DSD number (\"who superseded it?\"). Answers the opposite direction of the replaces field."),
   includeVoided: prop({ type: "boolean" }, false, "Include voided decisions; default false."),
   limit: prop(INTEGER, false, "Page size 1–20; default 10."),
   offset: prop(INTEGER, false, "Non-negative safe integer; default 0. Increase it to page."),
@@ -392,7 +393,7 @@ const SEARCH_PARAMETERS: Record<string, SchemaNode> = {
 
 /** decision_get (contract lines 145-177). */
 const GET_DESCRIPTION =
-"Read one complete decision, including its current status, revision and typed refs, from the current session's project by DSD number. The refs list answers whether the decision has a downstream task (filter it by type). Voided decisions remain readable. A decision that does not exist here is reported the same way as one that belongs elsewhere.";
+"Read one complete decision, including its current status, revision and typed refs, from the current session's project by DSD number. The refs list answers whether the decision has a downstream task (filter it by type), and replaces lists the decisions this one declares it supersedes. Voided decisions remain readable. A decision that does not exist here is reported the same way as one that belongs elsewhere.";
 
 const GET_PARAMETERS: Record<string, SchemaNode> = {
   decisionId: prop(INTEGER, true, "Positive integer DSD number shown in search results."),
@@ -474,6 +475,7 @@ const SEARCH_DATA: SchemaNode = objectNode({
         status: prop({ type: "string", enum: [...STATUS] }, true, "effective or voided."),
         timeHorizon: prop({ type: "string", enum: [...HORIZON] }, true, "long_term or temporary."),
         externalId: prop(NULLABLE, true, "External id (e.g. ledger D number) when set, else null; identifies hits without a follow-up get."),
+        replaces: prop({ type: "array", items: INTEGER }, true, "The decisions this record declares it replaces; null when it declares none."),
       }),
     },
     true,

@@ -31,7 +31,12 @@ import type {
 // start NULL). The time_horizon column default for fresh databases becomes
 // long_term; migrated v1 databases keep their old column default, which the
 // store never reads because every insert passes time_horizon explicitly.
-const SCHEMA_VERSION = 2;
+// task-615 (609 G3): schema v3 adds decision_replaces, the reverse index for
+// "which decisions declare that they replace X". It is a DERIVED projection of
+// decisions.replaces_json (the declaration stays the single authority; see
+// docs/replaces-reverse-lookup-design.md §3). v1 and v2 databases migrate in
+// place; a migration failure aborts the open instead of degrading.
+const SCHEMA_VERSION = 3;
 const UNICODE_WHITE_SPACE_SQL = "char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)";
 
 export interface SQLiteDecisionStoreOptions {
@@ -83,6 +88,10 @@ export interface DecisionSearchItem {
   /** task-406 自用验证：命中项直接带外部键（台账 D 号），无需逐条 get 回查；
    * 未设 externalId 的决策为 null。只增字段，不改既有字段语义。 */
   externalId: string | null;
+  /** task-615 (609 G3): the declaration this record carries ("I replace these"),
+   * read from the AUTHORITY (replaces_json), not from the projection. null when
+   * the record declares nothing. */
+  replaces: number[] | null;
 }
 
 export interface DecisionSearchPage {
@@ -504,6 +513,9 @@ interface DecisionSearchParsedInput {
   /** task-393: present together; filter decisions by an outgoing ref edge. */
   refType: DecisionRefType | undefined;
   refId: string | undefined;
+  /** task-615 (609 G3): reverse supersession — "which decisions declare that
+   * they replace this one". */
+  replacedDecisionId: number | undefined;
   /** task-424 (D-1257): "literal" is the frozen 377 substring semantics,
    * byte-identical default; "keywords" splits query on Unicode whitespace and
    * requires every token to match (AND of per-token literal-substring groups).
@@ -531,6 +543,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   let timeHorizon: TimeHorizon | undefined;
   let refType: DecisionRefType | undefined;
   let refId: string | undefined;
+  let replacedDecisionId: number | undefined;
   let queryMode: "literal" | "keywords" | undefined;
   let hasQuery = false;
   for (const [key, value] of Object.entries(input)) {
@@ -556,6 +569,15 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
           return validationFailure("refType", "Expected ref type decision, task, plan or commit; a decision must not reference bl (direction rule).");
         }
         refType = value as DecisionRefType;
+      }
+      continue;
+    }
+    if (key === "replacedDecisionId") {
+      if (value !== undefined) {
+        if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+          return validationFailure("replacedDecisionId", "Expected a positive safe integer decision number.");
+        }
+        replacedDecisionId = value;
       }
       continue;
     }
@@ -608,6 +630,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
         timeHorizon,
         refType,
         refId,
+        replacedDecisionId,
         queryMode: queryMode ?? "literal",
         keywords,
         includeVoided: parsed.data.includeVoided,
@@ -641,7 +664,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
     }
     offset = value;
   }
-  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, queryMode: "literal" as const, keywords: [], includeVoided, limit, offset } };
+  return { ok: true, data: { query: undefined, timeHorizon, refType, refId, replacedDecisionId, queryMode: "literal" as const, keywords: [], includeVoided, limit, offset } };
 }
 
 function timestamp(): string {
@@ -920,6 +943,10 @@ __REFS_TABLE__
 CREATE UNIQUE INDEX uq_decision_refs_edge ON decision_refs(decision_id, ref_type, ref_key);
 CREATE INDEX idx_decision_refs_reverse ON decision_refs(ref_type, ref_key);
 
+__REPLACES_TABLE__
+CREATE UNIQUE INDEX uq_decision_replaces_edge ON decision_replaces(decision_id, replaced_id);
+CREATE INDEX idx_decision_replaces_reverse ON decision_replaces(replaced_id, decision_id);
+
 CREATE TABLE decision_revisions (
   id INTEGER PRIMARY KEY,
   decision_id INTEGER NOT NULL,
@@ -957,6 +984,24 @@ function decisionRefsTableSql(strict: boolean): string {
 )${strict ? " STRICT" : ""};`;
 }
 
+// task-615 (609 G3): the supersession projection. One row per declared
+// (declarer, replaced) pair; replaces_json remains the authority, this table is
+// the index-backed projection the reverse query reads. replaced_id deliberately
+// has NO foreign key: a decision may declare that it replaces a record that has
+// not been imported yet (G1 forward references stay legal).
+function decisionReplacesTableSql(strict: boolean): string {
+  return `CREATE TABLE decision_replaces (
+  id INTEGER PRIMARY KEY,
+  decision_id INTEGER NOT NULL,
+  replaced_id INTEGER NOT NULL CONSTRAINT ck_decision_replaces_replaced_id
+    CHECK (replaced_id > 0),
+  created_at TEXT NOT NULL,
+  CONSTRAINT uq_decision_replaces_edge UNIQUE (decision_id, replaced_id),
+  CONSTRAINT fk_decision_replaces_decision_id
+    FOREIGN KEY (decision_id) REFERENCES decisions(id) ON DELETE RESTRICT
+)${strict ? " STRICT" : ""};`;
+}
+
 // SQLite 3.37+ parses the STRICT table suffix; older libraries must keep the
 // plain schema. The runtime is probed instead of assumed.
 function sqliteSupportsStrictTables(database: DatabaseSync): boolean {
@@ -971,7 +1016,8 @@ function sqliteSupportsStrictTables(database: DatabaseSync): boolean {
 function schemaSql(strict: boolean): string {
   return SCHEMA_SQL
     .replaceAll("__STRICT__", strict ? "STRICT" : "")
-    .replace("__REFS_TABLE__", decisionRefsTableSql(strict));
+    .replace("__REFS_TABLE__", decisionRefsTableSql(strict))
+    .replace("__REPLACES_TABLE__", decisionReplacesTableSql(strict));
 }
 
 // v1 -> v2 migration (task-377). ALTER TABLE ADD COLUMN appends the two new
@@ -987,6 +1033,19 @@ CREATE UNIQUE INDEX uq_decisions_external_id ON decisions(external_id);
 __REFS_TABLE__
 CREATE UNIQUE INDEX uq_decision_refs_edge ON decision_refs(decision_id, ref_type, ref_key);
 CREATE INDEX idx_decision_refs_reverse ON decision_refs(ref_type, ref_key);
+`;
+
+// v2 -> v3 migration (task-615). Creates the projection and BACKFILLS it from
+// the authority (decisions.replaces_json), using each declarer's own created_at
+// so a historical declaration is not rewritten as if it happened today.
+const MIGRATION_V2_TO_V3_SQL = `
+__REPLACES_TABLE__
+CREATE UNIQUE INDEX uq_decision_replaces_edge ON decision_replaces(decision_id, replaced_id);
+CREATE INDEX idx_decision_replaces_reverse ON decision_replaces(replaced_id, decision_id);
+INSERT INTO decision_replaces (decision_id, replaced_id, created_at)
+  SELECT d.id, j.value, d.created_at
+  FROM decisions d, json_each(d.replaces_json) j
+  WHERE d.replaces_json IS NOT NULL AND json_valid(d.replaces_json);
 `;
 
 function schemaTableNames(database: DatabaseSync): string[] {
@@ -1011,8 +1070,25 @@ const EXPECTED_INDEXES_V1 = [
   "uq_session_projects_session_id",
 ];
 
-const EXPECTED_TABLES = ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"];
+// The v2 shape, used to validate a v2 database BEFORE migrating it to v3.
+const EXPECTED_TABLES_V2 = ["decision_refs", "decision_revisions", "decisions", "projects", "session_projects"];
+const EXPECTED_INDEXES_V2 = [
+  "idx_decision_refs_reverse",
+  "idx_decision_revisions_decision_created",
+  "idx_decisions_project_updated",
+  "idx_projects_name",
+  "idx_session_projects_project_id",
+  "uq_decision_refs_edge",
+  "uq_decisions_external_id",
+  "uq_projects_project_key",
+  "uq_session_projects_session_id",
+];
+
+// The v3 shape: v2 plus the decision_replaces projection (task-615).
+const EXPECTED_TABLES = ["decision_refs", "decision_replaces", "decision_revisions", "decisions", "projects", "session_projects"];
 const EXPECTED_INDEXES = [
+  "idx_decision_replaces_reverse",
+  "uq_decision_replaces_edge",
   "idx_decision_refs_reverse",
   "idx_decision_revisions_decision_created",
   "idx_decisions_project_updated",
@@ -1062,10 +1138,16 @@ function preflightSchema(database: DatabaseSync): number {
     return 0;
   }
   if (version === 1) {
-    // A v1 database migrates to v2 on open. Refuse anything that is not exactly
+    // A v1 database migrates to v3 on open. Refuse anything that is not exactly
     // the v1 shape BEFORE touching it, so a foreign file is never ALTERed.
     assertSchemaShape(database, EXPECTED_TABLES_V1, EXPECTED_INDEXES_V1);
     return 1;
+  }
+  if (version === 2) {
+    // task-615: a v2 database migrates to v3. Same rule as v1 — validate the
+    // shape we are about to ALTER, never a foreign file.
+    assertSchemaShape(database, EXPECTED_TABLES_V2, EXPECTED_INDEXES_V2);
+    return 2;
   }
   if (version !== SCHEMA_VERSION) {
     throw new Error(`Unsupported database schema version ${version}.`);
@@ -1074,11 +1156,30 @@ function preflightSchema(database: DatabaseSync): number {
   return version;
 }
 
-function migrateSchemaV1ToV2(database: DatabaseSync): void {
+function migrateSchemaV1ToV3(database: DatabaseSync): void {
   const strict = sqliteSupportsStrictTables(database);
   database.exec("BEGIN IMMEDIATE");
   try {
+    // Both steps inside ONE transaction: a v1 database either ends up fully at
+    // v3 or is left exactly as it was. user_version only moves at the end, so a
+    // failure mid-chain cannot look like a half-migrated v2 file.
     database.exec(MIGRATION_V1_TO_V2_SQL.replace("__REFS_TABLE__", decisionRefsTableSql(strict)));
+    database.exec(MIGRATION_V2_TO_V3_SQL.replace("__REPLACES_TABLE__", decisionReplacesTableSql(strict)));
+    assertForeignKeyIntegrity(database);
+    database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch { /* Preserve the original migration error. */ }
+    throw error;
+  }
+  database.exec("PRAGMA optimize");
+}
+
+function migrateSchemaV2ToV3(database: DatabaseSync): void {
+  const strict = sqliteSupportsStrictTables(database);
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(MIGRATION_V2_TO_V3_SQL.replace("__REPLACES_TABLE__", decisionReplacesTableSql(strict)));
     assertForeignKeyIntegrity(database);
     database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     database.exec("COMMIT");
@@ -1104,7 +1205,9 @@ function initializeSchema(database: DatabaseSync, version: number): void {
     }
     database.exec("PRAGMA optimize");
   } else if (version === 1) {
-    migrateSchemaV1ToV2(database);
+    migrateSchemaV1ToV3(database);
+  } else if (version === 2) {
+    migrateSchemaV2ToV3(database);
   }
   assertSchemaShape(database);
 }
@@ -1541,7 +1644,7 @@ export class SQLiteDecisionStore {
     if (!parsed.ok) return parsed;
     this.assertOpen();
 
-    const { query, timeHorizon, refType, refId, queryMode, keywords, includeVoided, limit, offset } = parsed.data;
+    const { query, timeHorizon, refType, refId, replacedDecisionId, queryMode, keywords, includeVoided, limit, offset } = parsed.data;
     const whereParts = ["project_id = ?"];
     const values: BindValue[] = [projectId.data];
     if (!includeVoided) whereParts.push("status = 'effective'");
@@ -1555,6 +1658,13 @@ export class SQLiteDecisionStore {
       // decisions reference this key" (requirements §11 item 3).
       whereParts.push("id IN (SELECT decision_id FROM decision_refs WHERE ref_type = ? AND ref_key = ?)");
       values.push(refType, refId);
+    }
+    if (replacedDecisionId !== undefined) {
+      // task-615 (609 G3): the reverse supersession query. The subquery is
+      // exactly the idx_decision_replaces_reverse(replaced_id, decision_id)
+      // access path: covering, so no table lookup is needed.
+      whereParts.push("id IN (SELECT decision_id FROM decision_replaces WHERE replaced_id = ?)");
+      values.push(replacedDecisionId);
     }
     if (query !== undefined) {
       if (queryMode === "keywords") {
@@ -1577,7 +1687,7 @@ export class SQLiteDecisionStore {
         values.push(pattern, pattern, pattern, pattern);
       }
     }
-    const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status, time_horizon AS timeHorizon, external_id AS externalId
+    const sql = `SELECT id AS decisionId, summary, decision_text AS decision, status, time_horizon AS timeHorizon, external_id AS externalId, replaces_json AS replacesJson
       FROM decisions
       WHERE ${whereParts.join(" AND ")}
       ORDER BY updated_at DESC, id DESC
@@ -1585,7 +1695,7 @@ export class SQLiteDecisionStore {
     values.push(limit + 1, offset);
 
     try {
-      const rows = many<{ decisionId: number; summary: string | null; decision: string; status: DecisionStatus; timeHorizon: TimeHorizon; externalId: string | null }>(
+      const rows = many<{ decisionId: number; summary: string | null; decision: string; status: DecisionStatus; timeHorizon: TimeHorizon; externalId: string | null; replacesJson: string | null }>(
         this.database,
         sql,
         values,
@@ -1601,6 +1711,7 @@ export class SQLiteDecisionStore {
             status: row.status,
             timeHorizon: row.timeHorizon,
             externalId: row.externalId,
+            replaces: row.replacesJson === null ? null : JSON.parse(row.replacesJson) as number[],
           })),
           hasMore,
         },
@@ -1892,6 +2003,14 @@ export class SQLiteDecisionStore {
       const insertRef = prepare(this.database,
         "INSERT INTO decision_refs (decision_id, ref_type, ref_key, created_at) VALUES (?, ?, ?, ?)");
       for (const ref of input.refs) insertRef.run(decisionId, ref.type, ref.id, createdAt);
+    }
+    // task-615 (609 G3): the reverse-lookup projection, written in the SAME
+    // transaction as the declaration, so the two cannot drift on the normal path.
+    // replaces_json stays the authority (docs/replaces-reverse-lookup-design.md §3).
+    if (input.replaces !== undefined && input.replaces.length > 0) {
+      const insertReplaces = prepare(this.database,
+        "INSERT INTO decision_replaces (decision_id, replaced_id, created_at) VALUES (?, ?, ?)");
+      for (const replacedId of input.replaces) insertReplaces.run(decisionId, replacedId, createdAt);
     }
     return {
       decisionId,

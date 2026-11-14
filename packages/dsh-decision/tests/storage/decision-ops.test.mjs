@@ -834,8 +834,9 @@ test("task-609: replaces is a declaration — unknown numbers are still accepted
   // declare that it replaces itself" — kept out of here on purpose, so a mutation
   // of that check reds exactly one test.
 
-  // Gap 3: "who superseded this decision" has no query face — replaces is
-  // write-only apart from being echoed on get, and update cannot change it.
+  // Gap 3 was implemented by task-615: "who superseded this decision" is now a
+  // query (replacedDecisionId) and list items carry replaces. What remains is G4:
+  // update still cannot change either declaration.
   const searchBySuccessor = store.searchDecisions(p.projectId, { replacedBy: 1 });
   errorOf(searchBySuccessor, "VALIDATION_FAILED");
   assert.equal(searchBySuccessor.error.field, "replacedBy");
@@ -847,10 +848,12 @@ test("task-609: replaces is a declaration — unknown numbers are still accepted
   });
   errorOf(patchReplaces, "VALIDATION_FAILED");
   assert.equal(patchReplaces.error.field, "patch.replaces");
-  // The list items do not carry replaces either, so a successor is invisible
-  // unless the caller already knows its id.
+  // task-615: list items now carry the declaration, so a successor is visible
+  // without a follow-up get.
   const list = dataOf(store.searchDecisions(p.projectId, {}));
-  assert.equal("replaces" in list.decisions[0], false);
+  for (const item of list.decisions) {
+    assert.ok("replaces" in item, "every list item carries replaces (null when it declares none)");
+  }
 });
 
 test("the default list separates temporary from long_term without a keyword", (t) => {
@@ -1058,6 +1061,64 @@ test("the reverse filter requires both coordinates and validates refId", (t) => 
   const withQuery = store.searchDecisions(p.projectId, { query: "seed", refType: "task" });
   errorOf(withQuery, "VALIDATION_FAILED");
   assert.equal(withQuery.error.field, "refId");
+});
+
+test("task-615: decision_search answers \"who replaced this decision\" through the reverse index", (t) => {
+  const store = storeFor(t);
+  const p = project(store);
+  const oldA = dataOf(store.createDecision(p.projectId, { decision: "old A" }));
+  const oldB = dataOf(store.createDecision(p.projectId, { decision: "old B" }));
+  const newer = dataOf(store.createDecision(p.projectId, { decision: "newer", replaces: [oldA.decisionId] }));
+  dataOf(store.createDecision(p.projectId, { decision: "unrelated" }));
+
+  // Hit: exactly the decisions that declare they replace oldA.
+  const hits = dataOf(store.searchDecisions(p.projectId, { replacedDecisionId: oldA.decisionId }));
+  assert.deepEqual(hits.decisions.map((d) => d.decisionId), [newer.decisionId]);
+  // Miss is an empty page, not an error (nothing declares it).
+  const miss = dataOf(store.searchDecisions(p.projectId, { replacedDecisionId: oldB.decisionId }));
+  assert.deepEqual(miss.decisions, []);
+  assert.equal(miss.hasMore, false);
+  // The reversed direction (declarer -> its targets) stays on get.
+  assert.deepEqual(dataOf(store.getDecision(p.projectId, { decisionId: newer.decisionId })).replaces, [oldA.decisionId]);
+
+  // The projection is exactly the authority, pair by pair (task-615 design §3).
+  const pairs = store.database
+    .prepare("SELECT decision_id, replaced_id FROM decision_replaces ORDER BY decision_id, replaced_id")
+    .all().map((row) => [row.decision_id, row.replaced_id]);
+  const authority = store.database
+    .prepare("SELECT id, replaces_json FROM decisions WHERE replaces_json IS NOT NULL ORDER BY id")
+    .all().flatMap((row) => JSON.parse(row.replaces_json).map((replaced) => [row.id, replaced]));
+  assert.deepEqual(pairs, authority, "projection == replaces_json, no drift on the normal write path");
+
+  // Access path: the subquery must use the covering reverse index.
+  const plan = store.database.prepare(
+    "EXPLAIN QUERY PLAN SELECT id FROM decisions WHERE project_id = ? AND id IN (SELECT decision_id FROM decision_replaces WHERE replaced_id = ?)",
+  ).all(p.projectId, oldA.decisionId).map((row) => row.detail);
+  const reversePlan = plan.find((detail) => /decision_replaces/.test(detail)) ?? "";
+  assert.match(reversePlan, /idx_decision_replaces_reverse/, "the reverse query must use its index: " + JSON.stringify(plan));
+  assert.match(reversePlan, /COVERING INDEX/, "and it must not need a table lookup");
+  assert.ok(!plan.some((detail) => /SCAN decision_replaces/.test(detail)));
+
+  // Composite filters and project scope.
+  const combined = dataOf(store.searchDecisions(p.projectId, { replacedDecisionId: oldA.decisionId, timeHorizon: "long_term" }));
+  assert.deepEqual(combined.decisions.map((d) => d.decisionId), [newer.decisionId]);
+  const other = project(store, "Borealis", "borealis");
+  dataOf(store.createDecision(other.projectId, { decision: "foreign declares", replaces: [oldA.decisionId] }));
+  const scoped = dataOf(store.searchDecisions(p.projectId, { replacedDecisionId: oldA.decisionId }));
+  assert.deepEqual(scoped.decisions.map((d) => d.decisionId), [newer.decisionId], "another project's declaration does not leak in");
+
+  // The list carries the declaration itself, so a successor is visible without get.
+  const item = scoped.decisions[0];
+  assert.deepEqual(item.replaces, [oldA.decisionId]);
+  const voidedItem = dataOf(store.searchDecisions(p.projectId, {}));
+  assert.ok(voidedItem.decisions.every((d) => Array.isArray(d.replaces) || d.replaces === null));
+
+  // Invalid coordinates are rejected, not ignored.
+  for (const bad of [0, -1, 1.5, "1", null, {}]) {
+    const result = store.searchDecisions(p.projectId, { replacedDecisionId: bad });
+    errorOf(result, "VALIDATION_FAILED");
+    assert.equal(result.error.field, "replacedDecisionId", JSON.stringify(bad));
+  }
 });
 
 test("task-609: the reverse query is served by idx_decision_refs_reverse, and refs are declarations", (t) => {

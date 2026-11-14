@@ -476,6 +476,8 @@ test("T377: tool schemas expose the extension fields and keep bl out of the enum
   assert.ok(batchData.properties.decisions.items.properties.existingProjectId !== undefined);
 
   const searchParams = byName.get("decision_search").parameters;
+  assert.ok(searchParams.replacedDecisionId !== undefined, "task-615: reverse supersession parameter is declared");
+  assert.notEqual(searchParams.replacedDecisionId.required, true, "replacedDecisionId is optional");
   assert.notEqual(searchParams.query.required, true, "query is optional: omission lists");
   assert.deepEqual(searchParams.timeHorizon.enum, ["long_term", "temporary"]);
 
@@ -490,6 +492,8 @@ test("T377: tool schemas expose the extension fields and keep bl out of the enum
   assert.ok(getData.properties.replaces !== undefined);
   const searchData = byName.get("decision_search").output.schema.properties.data;
   assert.ok(searchData.properties.decisions.items.properties.timeHorizon !== undefined);
+  assert.ok(searchData.properties.decisions.items.properties.replaces !== undefined, "task-615: list items declare replaces");
+  assert.equal(searchData.properties.decisions.items.properties.replaces.required, true);
 });
 
 test("task-600: the tool face rejects a padded key and marks a key owned by another project", async (t) => {
@@ -516,6 +520,32 @@ test("task-600: the tool face rejects a padded key and marks a key owned by anot
   const mineAgain = await invoke(create, root, { decision: "mine", externalId: "DSD-1" });
   assert.equal(mineAgain.value.ok, true, JSON.stringify(mineAgain.value));
   assert.equal("existingProjectId" in mineAgain.value.data, false, "a same-project create carries no marker");
+});
+
+test("task-615: decision_search exposes the reverse supersession query through the tool face", async (t) => {
+  const store = storeFor(t);
+  const { root, tools } = boundTools(t, store);
+  const create = tools.get("decision_create");
+  const search = tools.get("decision_search");
+  const oldOne = await invoke(create, root, { decision: "old ruling" });
+  const newer = await invoke(create, root, { decision: "newer ruling", replaces: [oldOne.value.data.decisionId] });
+  assert.deepEqual(
+    (await invoke(tools.get("decision_get"), root, { decisionId: newer.value.data.decisionId })).value.data.replaces,
+    [oldOne.value.data.decisionId],
+  );
+
+  const reverse = await invoke(search, root, { replacedDecisionId: oldOne.value.data.decisionId });
+  assert.equal(reverse.value.ok, true, JSON.stringify(reverse.value));
+  assert.deepEqual(reverse.value.data.decisions.map((d) => d.decisionId), [newer.value.data.decisionId]);
+  assert.deepEqual(reverse.value.data.decisions[0].replaces, [oldOne.value.data.decisionId], "list items carry the declaration");
+
+  const miss = await invoke(search, root, { replacedDecisionId: 9999 });
+  assert.equal(miss.value.ok, true, JSON.stringify(miss.value));
+  assert.deepEqual(miss.value.data.decisions, [], "nothing replaced it: an empty page, not an error");
+
+  const bad = await invoke(search, root, { replacedDecisionId: "1" });
+  assert.equal(bad.value.ok, false, JSON.stringify(bad.value));
+  assert.equal(bad.value.error.field, "replacedDecisionId");
 });
 
 // --------------------------------------------------- task-393 refs-of surface
