@@ -4,3 +4,6 @@
 
 # TypeScript project-reference build output
 /packages/dsh-decision/.tsbuild/
+
+# 构建产物（tsc 可再生）：入口 JS 由 `pnpm -C packages/dsh-decision run build` 生成，不入库
+/packages/dsh-decision/lib/

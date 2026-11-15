@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.host.json",
+  "compilerOptions": {
+    "composite": false,
+    "incremental": true,
+    "emitDeclarationOnly": false,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "outDir": "./lib",
+    "rootDir": "./src",
+    "tsBuildInfoFile": "./.tsbuild/build.tsbuildinfo"
+  },
+  "include": [
+    "src/domain/**/*.ts",
+    "src/storage/**/*.ts",
+    "src/host/**/*.ts",
+    "src/index.ts"
+  ]
+}

@@ -4,17 +4,36 @@
   "private": true,
   "description": "DSD domain module; candidate package name availability remains to be checked at M0.",
   "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "manifestVersion": 1
+  },
   "engines": {
     "node": ">=24"
   },
-  "files": [],
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
   "scripts": {
     "test": "node --test tests/domain/decision-contract.test.mjs tests/storage/sqlite-store.test.mjs tests/storage/decision-ops.test.mjs tests/storage/timestamp-order.test.mjs tests/host/config.test.mjs tests/host/caller.test.mjs tests/host/binding.test.mjs tests/host/first-binding.test.mjs tests/host/tools.test.mjs tests/scripts/ledger-fixtures.test.mjs",
     "test:executor": "node --test tests/executor/executor-matrix.test.mjs",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.2.2-rc.3",
     "@deepseek-ai/schemastery": "~3.19.0"
   },
   "devDependencies": {

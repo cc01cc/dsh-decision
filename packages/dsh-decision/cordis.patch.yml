@@ -1,0 +1,6 @@
+# task-147 —— 本包作为 DSH bundle 被 profile 引用时要插入的 loader 条目。
+# 形态对齐已装好的参考包 dsh-notification/cordis.patch.yml（同一层、同一写法），不自造。
+# 用户可在自己 profile 的 cordis.patch.yml 里覆盖此处 config。
+- insert:
+    - id: dsh-decision
+      name: "@cc01cc/dsh-decision"

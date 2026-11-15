@@ -99,6 +99,32 @@ function findPackages(root) {
     return dirs;
 }
 
+/**
+ * task-147 新增的第二根轴：**「声明必须存在」**。
+ *
+ * <p>旧版只回答「如果声明了，目标在不在」—— 于是「什么都不声明」也能绿（原文案：无可校验目标）。
+ * 本包上一版就是 `files: []` + 无 `main`/`exports`/`dsh`，因此**装进 profile 拿到的是空包，
+ * 而闸门一路绿**。现在补上：作为 DSH 插件，这三样必须自己声明出来，否则同样算红。</p>
+ *
+ * <p>为什么三者是同一个判断：`main/exports` 回答「Node 解析得到入口吗」，`files` 回答
+ * 「pnpm pack 出来的包里有没有产物」，`dsh.bundle.patch` 回答「profile 里插得进 loader 条目吗」。
+ * 缺任何一条，插件都装不进去 —— 不是三个缺陷，是同一个「不可加载形态」的三种缺法。</p>
+ */
+export function collectPluginShapeIssues(manifest) {
+    const issues = [];
+    const hasEntry = (typeof manifest.main === "string" && manifest.main.trim() !== "") ||
+        (manifest.exports && typeof manifest.exports === "object" && manifest.exports["."] !== undefined);
+    if (!hasEntry) issues.push("没有入口声明（main 或 exports[\".\"]）⇒ import(包名) 无法解析");
+    const patch = manifest.dsh && manifest.dsh.bundle && manifest.dsh.bundle.patch;
+    if (typeof patch !== "string" || patch.trim() === "") {
+        issues.push("没有 dsh.bundle.patch ⇒ profile 里装得上但插不进 loader 条目");
+    }
+    if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
+        issues.push("files 为空 ⇒ pnpm pack 出来的包里没有任何产物");
+    }
+    return issues;
+}
+
 /** Judge one directory. `missing` is deduped by resolved path but keeps every declaration that points at it. */
 export function checkPackage(dir) {
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
@@ -119,6 +145,7 @@ export function checkPackage(dir) {
         dir,
         declaredCount: declared.length,
         missing: [...byPath.values()],
+        shapeIssues: collectPluginShapeIssues(manifest),
     };
 }
 
@@ -165,9 +192,10 @@ function main(argv) {
     }
 
     const missingTotal = reports.reduce((sum, report) => sum + report.missing.length, 0);
+    const shapeTotal = reports.reduce((sum, report) => sum + report.shapeIssues.length, 0);
     if (json) {
-        process.stdout.write(JSON.stringify({ root, ok: missingTotal === 0, missingTotal, packages: reports }, null, 2) + "\n");
-    } else if (missingTotal === 0) {
+        process.stdout.write(JSON.stringify({ root, ok: missingTotal === 0 && shapeTotal === 0, missingTotal, shapeTotal, packages: reports }, null, 2) + "\n");
+    } else if (missingTotal === 0 && shapeTotal === 0) {
         for (const report of reports) {
             process.stdout.write(
                 "[check-package-surface] " + report.name + ": " +
@@ -177,6 +205,11 @@ function main(argv) {
             );
         }
     } else {
+        for (const report of reports) {
+            for (const issue of report.shapeIssues) {
+                process.stdout.write("[check-package-surface] " + report.name + ": ✗ " + issue + "\n");
+            }
+        }
         for (const report of reports) {
             if (report.missing.length === 0) continue;
             process.stdout.write(
@@ -191,11 +224,11 @@ function main(argv) {
             }
         }
         process.stdout.write(
-            "[check-package-surface] 合计 " + missingTotal + " 个声明目标缺失（" +
+            "[check-package-surface] 合计 " + missingTotal + " 个声明目标缺失、 " + shapeTotal + " 条形态缺失（" +
                 (path.relative(process.cwd(), root) || root) + " 下）\n",
         );
     }
-    return missingTotal === 0 ? 0 : 1;
+    return missingTotal === 0 && shapeTotal === 0 ? 0 : 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
