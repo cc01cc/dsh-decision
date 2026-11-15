@@ -1,6 +1,19 @@
 # task-147 —— 本包作为 DSH bundle 被 profile 引用时要插入的 loader 条目。
 # 形态对齐已装好的参考包 dsh-notification/cordis.patch.yml（同一层、同一写法），不自造。
 # 用户可在自己 profile 的 cordis.patch.yml 里覆盖此处 config。
+#
+# task-157：`databasePath` 默认值**只活在这一层**（插件代码仍 required()、无回落），
+# 值由 loader 的配置树锚点 `ctx.baseUrl` 推出 —— 它是**被加载配置文件所在目录**的 file:// URL
+# （Include: `this.ctx.baseUrl = new URL('.', pathToFileURL(this.filename)).href`），
+# 对 profile 层即 `$DSH_HOME/profiles/<name>/`。约束（D-1523）：
+#   · 全函数、无 I/O、无副作用、**绝不抛**；`ctx.baseUrl` 缺失时返回 undefined
+#     ⇒ 落到插件现有的可操作报错（`$.databasePath missing required value` + help 段）。
+#   · 不改 1.6：profile 目录已存在，本插件**从不创建父目录**、不 mkdir。
+# 覆盖方式（profile 的 cordis.patch.yml）：
+#   - id: dsh-decision
+#     config: { databasePath: 'D:/data/decision.sqlite' }
 - insert:
     - id: dsh-decision
       name: "@cc01cc/dsh-decision"
+      config:
+        databasePath: !!js "(() => { const u = ctx.baseUrl; if (!u) return undefined; let s = decodeURIComponent(String(u)); if (s.startsWith('file:///')) s = s.slice(8); else if (s.startsWith('file://')) s = '//' + s.slice(7); if (!s.endsWith('/')) s += '/'; return s + 'decision.sqlite'; })()"

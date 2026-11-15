@@ -10,10 +10,17 @@ import type { DecisionHostSurfaces } from "./register.ts";
  * Host Config contract for the DSD plugin.
  *
  * The frozen contract (PLAN-0769 `spec/decision-contract.md` §1) requires one
- * explicit, non-empty, absolute SQLite file path per Profile. There is no
- * default: a missing, empty, relative, or `:memory:` path is refused before
- * any write, and the plugin never falls back to the shared `$DSH_HOME` or
- * `process.cwd()`. The parent directory is never created by the plugin.
+ * explicit, non-empty, absolute SQLite file path per Profile. **The plugin code
+ * has no default and never falls back** to the shared `$DSH_HOME` or
+ * `process.cwd()`; the shipped default (`<profile>/decision.sqlite`) is declared
+ * in the package's `cordis.patch.yml` as `config.databasePath` and can be
+ * overridden per Profile (task-157). A missing, empty, relative, or `:memory:`
+ * path is refused before any write. The parent directory is never created by the
+ * plugin.
+ *
+ * Contract SSOT: plans/PLAN-0769-DSD-decision-mvp/spec/decision-contract.md
+ * (path-clause supplement, same wording as this comment:
+ * packages/dsh-decision/spec/decision-contract.md). Change the file first.
  */
 export const Config = z.object({
   databasePath: z.string().min(1).required(),

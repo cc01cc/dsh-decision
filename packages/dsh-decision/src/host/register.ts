@@ -27,9 +27,30 @@ export interface DecisionHostSurfaces {
   readonly userQuestions: UserQuestionsSurface;
 }
 
-/** The Host tools package and the runtime version this plugin is wired against. */
+/** The Host tools package and the runtime line this plugin is wired against. */
 export const HOST_TOOLS_PACKAGE = "@deepseek-ai/dsh-tools";
-export const HOST_TOOLS_VERSION = "0.2.2-rc.1";
+
+/**
+ * The Host tools **runtime line** this plugin compiles against (task-167).
+ *
+ * <p>为什么是「线」不是「点」：原先把 `0.2.2-rc.1` 写死，运行时升到 `0.2.2-rc.3` 就整包拒绝加载
+ * —— rc 号是同一编译面内的发布计数，不是 API 断代点。判据因此定为：`major.minor.patch`
+ * **必须完全相等**，预发布标签（`rc`/`beta`…）**必须相同**；rc 序号可不同。</p>
+ *
+ * <p>这样 fail-closed 仍然有效：`0.2.3-rc.1`、`0.3.0`、`0.2.1`、乱码版本一律拒绝（见单测），
+ * 只是不再因为「rc 序号变了」把整个插件挡在门外。</p>
+ */
+export const HOST_TOOLS_VERSION_LINE = "0.2.2";
+
+/** Compare a resolved `dsh-tools` version against the wired runtime line; `true` when compatible. */
+export function isCompatibleHostToolsVersion(resolvedVersion: string): boolean {
+  const parsed = /^(\d+)\.(\d+)\.(\d+)(?:-([a-z]+)\.(\d+))?$/u.exec(resolvedVersion.trim());
+  if (parsed === null) return false;
+  const base = `${parsed[1]}.${parsed[2]}.${parsed[3]}`;
+  if (base !== HOST_TOOLS_VERSION_LINE) return false;
+  // Any prerelease tag is accepted only when it is the `rc` line; a plain release is the same compile surface.
+  return parsed[4] === undefined || parsed[4] === "rc";
+}
 
 /**
  * Register the six tools with the Host-provided compiler.
@@ -53,10 +74,11 @@ export async function registerDecisionToolsWithHost(
   const resolved = fileURLToPath(import.meta.resolve(specifier));
   const manifestPath = join(dirname(resolved), "..", "package.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { version?: unknown };
-  if (manifest.version !== HOST_TOOLS_VERSION) {
+  const resolvedVersion = typeof manifest.version === "string" ? manifest.version : "";
+  if (!isCompatibleHostToolsVersion(resolvedVersion)) {
     throw new Error(
       `${HOST_TOOLS_PACKAGE} resolved to version ${String(manifest.version)} at ${resolved}; ` +
-        `expected the Host runtime version ${HOST_TOOLS_VERSION}. Refusing to register against a mismatched compiler.`,
+        `expected the Host runtime line ${HOST_TOOLS_VERSION_LINE} (any rc). Refusing to register against a mismatched compiler.`,
     );
   }
   registerDecisionTools(
@@ -69,3 +91,6 @@ export async function registerDecisionToolsWithHost(
     defineTool as ToolCompiler,
   );
 }
+
+// 注：`lib/` 是 tsc 的生成物，**不要手改** —— tsc 的增量构建按内容判定，改了生成物又被跳过
+// 重新生成时，残留会一直留在包里（task-167 实测）。要加临时探针就改源码再 build，用完改回来。
