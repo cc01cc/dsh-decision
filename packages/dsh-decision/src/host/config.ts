@@ -23,6 +23,32 @@ export interface DecisionPluginConfig {
   databasePath: string;
 }
 
+/**
+ * task-147：把「缺 databasePath」从**一句字段缺失**变成**可照做的一段话**。
+ *
+ * <p>为什么不是给默认值：本插件的路径是**显式契约**（PLAN-0769 冻结；文件头第 12-16 行）——
+ * 缺省到底写哪里只能靠猜，而猜错就是把用户数据写进插件包或 `node_modules`（那两处由
+ * `assertOutsidePackage` 拒绝）。所以保持 `required()`，把「怎么填」说清楚。</p>
+ *
+ * <p>触发场景（实测）：profile 里只 `insert` 了 id/name 而没给 config ⇒ 启用时报
+ * `Invalid decision plugin Config: $.databasePath missing required value`，
+ * 用户看不出该填什么形态、填在哪。这段就是补这个缺口。</p>
+ */
+function configHelp(): string {
+  return [
+    "",
+    "The decision plugin needs an explicit SQLite file path and has NO default:",
+    "a missing path would mean guessing where your decisions live.",
+    "Fix: override the bundle entry in your profile patch (cordis.patch.yml), e.g.",
+    "  - id: dsh-decision",
+    '    name: "@cc01cc/dsh-decision"',
+    "    config:",
+    '      databasePath: "<absolute path to a .sqlite file>"',
+    "Constraints: absolute path; a file path (not an existing directory); not inside node_modules",
+    "or the plugin package; not :memory:. The parent directory must already exist.",
+  ].join("\n");
+}
+
 /** Package root of the plugin, resolved from this module's own location. */
 function packageRootPath(): string {
   let directory = dirname(fileURLToPath(import.meta.url));
@@ -67,7 +93,7 @@ export function resolveDatabasePath(input: unknown): string {
     config = validate(input);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    throw new TypeError(`Invalid decision plugin Config: ${reason}`);
+    throw new TypeError(`Invalid decision plugin Config: ${reason}${configHelp()}`);
   }
 
   const databasePath = validateDatabasePath(config.databasePath);

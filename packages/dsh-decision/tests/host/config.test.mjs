@@ -123,3 +123,20 @@ test("apply rejects a Config whose databasePath points inside node_modules", () 
   assert.throws(() => apply(fake.ctx, { databasePath }), /node_modules/i);
   assert.equal(getDecisionStoreOrUndefined(fake.ctx), undefined);
 });
+
+test("task-147: 缺 databasePath 的报错必须可照做（含形态与示例）", () => {
+    // 实测缺口：profile 只 insert 了 id/name 时，报错只有「$.databasePath missing required value」，
+    // 用户看不出该填什么。这里只断言关键短语，不锁整句（措辞会随 i18n/文案调整）。
+    assert.throws(
+        () => resolveDatabasePath({}),
+        (error) => {
+            assert.match(error.message, /Invalid decision plugin Config/u);
+            assert.match(error.message, /databasePath/u);
+            assert.match(error.message, /NO default/u);
+            assert.match(error.message, /absolute path/u);
+            assert.match(error.message, /not inside node_modules/u);
+            assert.match(error.message, /cordis\.patch\.yml/u);
+            return true;
+        },
+    );
+});
