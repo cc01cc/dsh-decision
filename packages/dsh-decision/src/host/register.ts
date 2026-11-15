@@ -16,14 +16,15 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { LiveAgentRegistry } from "./caller.ts";
+import { adaptAgentRegistry } from "./caller.ts";
 import { createQuestionAsker, type UserQuestionsSurface } from "./question-asker.ts";
 import { registerDecisionTools, type DecisionToolStore, type ToolCompiler } from "./tools.ts";
 
 /** Host surfaces the composition root consumes; cordis `inject` guarantees all three. */
 export interface DecisionHostSurfaces {
   readonly tools: { register(definition: unknown): unknown };
-  readonly agents: LiveAgentRegistry;
+  /** Raw `ctx.agents`; the registry shape varies across the 0.2.2 rc line (task-9). */
+  readonly agents: unknown;
   readonly userQuestions: UserQuestionsSurface;
 }
 
@@ -84,7 +85,7 @@ export async function registerDecisionToolsWithHost(
   registerDecisionTools(
     surfaces.tools,
     {
-      agents: surfaces.agents,
+      agents: adaptAgentRegistry(surfaces.agents),
       openStore,
       asker: createQuestionAsker(surfaces.userQuestions),
     },

@@ -42,10 +42,12 @@ export type CallerRejection = (typeof CALLER_REJECTIONS)[number];
 /**
  * The minimal live-agent registry surface this gate needs.
  *
- * Declared structurally so the real `ctx.agents` service satisfies it as-is:
- * `@deepseek-ai/dsh-agent/lib/index.js:725-727` (`get(id)` returns the exact
- * live agent) and `:752-754` (`roots()` returns `entry.owner === undefined`
- * agents, a fresh array). Tests inject a fake of the same shape.
+ * Declared structurally. The 0.2.2-rc.1 Host `AgentRegistry` satisfies it
+ * as-is (`get(id)` returns the exact live agent; `roots()` returns the
+ * `entry.owner === undefined` agents, a fresh array). The rc.3 Host replaced
+ * `roots()` with `list()` (all live agents); `adaptAgentRegistry` below
+ * normalizes that shape to this interface without weakening the gate. Tests
+ * inject fakes of either shape.
  */
 export interface LiveAgentRegistry {
   get(id: string): unknown;
@@ -89,6 +91,71 @@ function assertUsableRegistry(agents: unknown): asserts agents is LiveAgentRegis
   if (typeof registry.get !== "function" || typeof registry.roots !== "function") {
     throw new TypeError("The live agent registry must expose get(id) and roots(); the caller gate cannot verify a caller without them.");
   }
+}
+
+/**
+ * Root-ness for the rc.3 registry shape, mirroring the Host's own reads
+ * (dsh-subagent `delegationDepthOf`: max(header.delegationDepth ?? 0,
+ * options.subagentDepth ?? 0); `rootOf`: header.origin === "subagent" marks a
+ * delegated session). Fail closed: an agent whose header/options cannot be
+ * read, or whose depths are not non-negative safe integers, is NOT a root.
+ */
+function isRootAgent(agent: unknown): boolean {
+  if (typeof agent !== "object" || agent === null) return false;
+  const record = agent as { session?: unknown; options?: unknown };
+  const session = record.session;
+  if (typeof session !== "object" || session === null) return false;
+  const header = (session as { header?: unknown }).header;
+  if (typeof header !== "object" || header === null) return false;
+  const facts = header as { origin?: unknown; delegationDepth?: unknown };
+  if (facts.origin === "subagent") return false;
+  const options = record.options;
+  const runtimeDepth = typeof options === "object" && options !== null
+    ? (options as { subagentDepth?: unknown }).subagentDepth
+    : undefined;
+  const headerDepth = facts.delegationDepth ?? 0;
+  const optionDepth = runtimeDepth ?? 0;
+  if (typeof headerDepth !== "number" || !Number.isSafeInteger(headerDepth) || headerDepth < 0) return false;
+  if (typeof optionDepth !== "number" || !Number.isSafeInteger(optionDepth) || optionDepth < 0) return false;
+  return Math.max(headerDepth, optionDepth) === 0;
+}
+
+/**
+ * Normalize the Host's live-agent registry to `LiveAgentRegistry` (task-9 /
+ * D-1651: plugin-side compatibility, no Host change).
+ *
+ * Two shapes exist on the 0.2.2 runtime line:
+ * - rc.1: `get(id)` + `roots()` — used as-is, identity semantics untouched.
+ * - rc.3: `get(id)` + `list()` — wrapped so `roots()` keeps only the agents
+ *   whose delegation depth is exactly 0 and whose origin is not "subagent".
+ *
+ * An agent whose root-ness cannot be established is EXCLUDED from `roots()`:
+ * the gate then refuses it with DELEGATED_CALLER instead of admitting an
+ * unverified caller or throwing. Fail closed, never fail open.
+ *
+ * @param raw - the Host `ctx.agents` service, of either known shape.
+ * @returns a registry the caller gate can verify against.
+ * @throws {TypeError} when the shape is neither known one (Host wiring bug).
+ */
+export function adaptAgentRegistry(raw: unknown): LiveAgentRegistry {
+  if (typeof raw !== "object" || raw === null) {
+    throw new TypeError("The live agent registry must be supplied; the caller gate cannot verify a caller without it.");
+  }
+  const candidate = raw as { get?: unknown; roots?: unknown; list?: unknown };
+  if (typeof candidate.get !== "function") {
+    throw new TypeError("The live agent registry must expose get(id) and roots(), or get(id) and list(); the caller gate cannot verify a caller without them.");
+  }
+  if (typeof candidate.roots === "function") {
+    return raw as LiveAgentRegistry;
+  }
+  if (typeof candidate.list === "function") {
+    const registry = raw as { get(id: string): unknown; list(): readonly unknown[] };
+    return {
+      get: (id: string): unknown => registry.get(id),
+      roots: (): readonly unknown[] => registry.list().filter(isRootAgent),
+    };
+  }
+  throw new TypeError("The live agent registry must expose get(id) and roots(), or get(id) and list(); the caller gate cannot verify a caller without them.");
 }
 
 /**

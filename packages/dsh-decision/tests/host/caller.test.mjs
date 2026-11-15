@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CALLER_REJECTIONS, requireCaller } from "../../src/host/caller.ts";
+import { CALLER_REJECTIONS, adaptAgentRegistry, requireCaller } from "../../src/host/caller.ts";
 
 /**
  * Caller gate L0 (PLAN-0778 A, contract §2 line 78).
@@ -100,4 +100,97 @@ test("throws only for a Host wiring bug, never for a caller problem", () => {
 
 test("rejection vocabulary is exactly the three contract-relevant reasons", () => {
   assert.deepEqual([...CALLER_REJECTIONS], ["CALLER_REQUIRED", "CALLER_NOT_LIVE", "DELEGATED_CALLER"]);
+});
+
+// ---------------------------------------------------------------------------
+// task-9 / D-1651 / D-1657: host registry shape adapter.
+// rc.1 = get(id)+roots(); rc.3 = get(id)+list() with root-ness in the session
+// header (origin / delegationDepth) and runtime options.subagentDepth — the
+// exact facts dsh-subagent's delegationDepthOf/rootOf read (host source quoted
+// in the task-9 evidence pack). The adapter must stay fail-closed: unreadable
+// or invalid facts exclude an agent from roots(), never admit it.
+// ---------------------------------------------------------------------------
+
+/** rc.3-shaped fake: get(id) + list(); root-ness lives in header/options. */
+function rc3RegistryOf(agents) {
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  const lookups = [];
+  return {
+    lookups,
+    get(id) { lookups.push(id); return byId.get(id); },
+    list() { return [...byId.values()]; },
+  };
+}
+
+/** Agent shaped like the rc.3 Host's: session.header + options carry the facts. */
+function rc3Agent(id, { header = {}, options = {} } = {}) {
+  return { id, session: { id, header }, options };
+}
+
+test("task-9: rc.1 registry (get+roots) passes through unchanged", () => {
+  const root = liveAgent("session-root");
+  const registry = registryOf([root]);
+  const adapted = adaptAgentRegistry(registry);
+  assert.equal(adapted, registry, "known shape is used as-is, no wrapper");
+  assert.equal(requireCaller(root, adapted).ok, true);
+});
+
+test("task-9: rc.3 registry (get+list) — roots() keeps only depth-0 non-subagent agents", () => {
+  const root = rc3Agent("s-root", { header: { origin: "user" } });
+  const child = rc3Agent("s-child", { header: { origin: "subagent", delegationDepth: 1 } });
+  const deepened = rc3Agent("s-deep", { header: {}, options: { subagentDepth: 2 } });
+  const adapted = adaptAgentRegistry(rc3RegistryOf([root, child, deepened]));
+  assert.deepEqual(adapted.roots(), [root]);
+  assert.equal(requireCaller(root, adapted).ok, true);
+  assertRefused(requireCaller(child, adapted), "DELEGATED_CALLER");
+  assertRefused(requireCaller(deepened, adapted), "DELEGATED_CALLER");
+});
+
+test("task-9: rc.3 root-ness is fail-closed on unreadable or invalid facts", () => {
+  // Each fixture guards one mutation: dropping the origin check, dropping the
+  // depth validation, or failing open on missing structure turns one red.
+  const root = rc3Agent("s-root");
+  const cases = [
+    ["origin subagent at depth 0", rc3Agent("s-a", { header: { origin: "subagent" } })],
+    ["negative header depth", rc3Agent("s-b", { header: { delegationDepth: -1 } })],
+    ["non-integer header depth", rc3Agent("s-c", { header: { delegationDepth: 1.5 } })],
+    ["string header depth", rc3Agent("s-d", { header: { delegationDepth: "1" } })],
+    ["NaN runtime depth", rc3Agent("s-e", { options: { subagentDepth: NaN } })],
+    ["negative runtime depth", rc3Agent("s-e2", { options: { subagentDepth: -2 } })],
+    ["missing header", { id: "s-f", session: { id: "s-f" }, options: {} }],
+    ["missing session", { id: "s-g", options: {} }],
+    ["null header", { id: "s-h", session: { id: "s-h", header: null }, options: {} }],
+  ];
+  const adapted = adaptAgentRegistry(rc3RegistryOf([root, ...cases.map(([, agent]) => agent)]));
+  assert.deepEqual(adapted.roots(), [root]);
+  for (const [, agent] of cases) {
+    assertRefused(requireCaller(agent, adapted), "DELEGATED_CALLER");
+  }
+});
+
+test("task-9: rc.3 null depth reads as absent (mirrors host ?? 0)", () => {
+  const root = rc3Agent("s-root", { header: { delegationDepth: null }, options: { subagentDepth: null } });
+  const adapted = adaptAgentRegistry(rc3RegistryOf([root]));
+  assert.deepEqual(adapted.roots(), [root]);
+  assert.equal(requireCaller(root, adapted).ok, true);
+});
+
+test("task-9: rc.3 keeps exact-identity and no-caller semantics", () => {
+  const root = rc3Agent("s-root");
+  const registry = rc3RegistryOf([root]);
+  const adapted = adaptAgentRegistry(registry);
+  assertRefused(requireCaller(undefined, adapted), "CALLER_REQUIRED");
+  assert.deepEqual(registry.lookups, []);
+  assertRefused(requireCaller(rc3Agent("s-root"), adapted), "CALLER_NOT_LIVE");
+  assertRefused(requireCaller(rc3Agent("s-ghost"), adapted), "CALLER_NOT_LIVE");
+  const ok = requireCaller(root, adapted);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.caller.sessionId, "s-root");
+  assert.equal(ok.caller.agent, root);
+});
+
+test("task-9: unknown registry shapes still throw TypeError (wiring bug)", () => {
+  for (const broken of [undefined, null, {}, "registry", { get() {} }, { list() { return []; } }, { roots() { return []; } }, { get: 1, roots() {} }]) {
+    assert.throws(() => adaptAgentRegistry(broken), TypeError);
+  }
 });

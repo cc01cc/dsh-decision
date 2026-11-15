@@ -7,7 +7,7 @@
  *   1. inject timing — apply is deferred until tools+agents+userQuestions all
  *      exist, then the six tools appear; no ctx.get-at-apply race.
  *   2. defineTool provenance — the compiler resolves to the Host runtime copy
- *      (0.2.2-rc.1), never the npm published 0.0.1-rc.1.
+ *      (the 0.2.2 line), never the npm published 0.0.1-rc.1.
  * Plus end-to-end calls through the wired plugin, the first-binding question
  * flow over the Host userQuestions surface, and unload semantics.
  *
@@ -194,11 +194,16 @@ maybe("wiring: inject defers apply until tools+agents+userQuestions all exist", 
 
 // ------------------------------------------------------- risk 2: defineTool provenance
 
-maybe("wiring: defineTool resolves to the Host runtime copy, version 0.2.2-rc.1", () => {
+maybe("wiring: defineTool resolves to the Host runtime copy on the 0.2.2 line", async () => {
   const resolved = fileURLToPath(import.meta.resolve("@deepseek-ai/dsh-tools"));
   assert.equal(resolved.startsWith(nm), true, "resolved inside the extracted Host tree: " + resolved);
   const manifest = JSON.parse(readFileSync(join(dirname(resolved), "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "0.2.2-rc.1", "Host runtime version, not npm 0.0.1-rc.1");
+  // task-9: the extracted Host moved from rc.1 to rc.3; task-167 (D-1238) had
+  // already moved the gate from a pinned rc point to the runtime line. Use the
+  // same line predicate as register.ts — provenance (Host copy, never the npm
+  // published 0.0.1-rc.1) stays asserted, no second pinned constant.
+  const { isCompatibleHostToolsVersion } = await import("../../src/host/register.ts");
+  assert.equal(isCompatibleHostToolsVersion(manifest.version), true, "Host runtime line, not npm 0.0.1-rc.1: " + manifest.version);
 });
 
 // ------------------------------------------------------- end-to-end through the plugin
@@ -255,4 +260,47 @@ maybe("wiring: unload unregisters the six tools and keeps the data durable", asy
   assert.equal(page.ok, true, "reopen search");
   assert.equal(page.data.decisions.length, 1, "data durable after unload");
   assert.equal(page.data.decisions[0].preview, "卸载前写入", "row content preserved (search preview = decision text when no summary)");
+});
+
+// ------------------------------------- task-9: rc.3 registry shape (real class)
+
+maybe("wiring: rc.3 AgentRegistry — root admitted, delegated refused through the real executor", async (t) => {
+  // task-9 / D-1651 / D-1657: the rc.3 Host AgentRegistry exposes get(id)+list()
+  // (roots() was removed). Mount the plugin against the REAL registry class and
+  // prove the composition-root adapter preserves the gate end to end. Fixture
+  // headers are the host's own facts: childSessionMeta writes origin:"subagent"
+  // + delegationDepth for every child (dsh-subagent lib/index.js; exact source
+  // quoted in the task-9 evidence pack).
+  const agentMod = await importFrom("@deepseek-ai/dsh-agent");
+  const app = await bootHost();
+  app.provide("sessionProjections", { register: async (def) => ({ stateOf: () => def.init() }) });
+  await app.plugin(agentMod.AgentRegistry);
+  const root = { id: "s-rc3-root", session: { id: "s-rc3-root", header: { origin: "user" } }, options: {} };
+  const child = { id: "s-rc3-child", session: { id: "s-rc3-child", header: { origin: "subagent", delegationDepth: 1 } }, options: {} };
+  app.agents.enter(root);
+  app.agents.enter(child);
+  assert.equal(app.agents.get("s-rc3-root"), root, "real registry get returns the exact instance");
+  assert.equal(typeof app.agents.roots, "undefined", "rc.3 registry has no roots() — the adapter must supply it");
+  const databasePath = join(tempRoot(), "decisions.sqlite");
+  app.provide("userQuestions", fakeUserQuestions("RC3 项目 · rc3"));
+  const dsd = await import("../../src/host/config.ts");
+  const fiber = app.plugin(dsd, { databasePath });
+  await fiber;
+  await untilRegistered(app);
+  const seed = SQLiteDecisionStore.open({ databasePath });
+  const made = seed.createProject({ name: "RC3 项目", projectKey: "rc3" });
+  assert.equal(made.ok, true, "seed project");
+  assert.equal(seed.bindSession("s-rc3-root", made.data.projectId).ok, true, "bind root");
+  assert.equal(seed.bindSession("s-rc3-child", made.data.projectId).ok, true, "bind child");
+  seed.close();
+  t.after(() => app.fiber.dispose());
+  const call = caller(app);
+  const asRoot = await call("decision_search", {}, root);
+  assert.equal(asRoot.isError, false, "root caller passes the adapted gate");
+  assert.equal(asRoot.value.ok, true, "root search envelope");
+  const asChild = await call("decision_search", {}, child);
+  assert.equal(asChild.isError, true, "delegated caller refused at registry level");
+  assert.equal(asChild.value, undefined, "no domain envelope for a caller refusal");
+  const noCaller = await call("decision_search", {}, undefined);
+  assert.equal(noCaller.isError, true, "missing caller still refused");
 });
