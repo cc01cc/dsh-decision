@@ -6,6 +6,9 @@ import { tmpdir } from "node:os";
 import { SQLiteDecisionStore } from "../../src/storage/sqlite-store.ts";
 import {
   NEW_PROJECT_LABEL,
+  PROJECT_SKIPPED_MESSAGE,
+  PROJECT_TYPED_AMBIGUOUS_MESSAGE,
+  PROJECT_TYPED_UNKNOWN_MESSAGE,
   buildKeySuggestion,
   buildProjectChoicePrompt,
   projectOptionLabel,
@@ -290,3 +293,73 @@ test("a key that collides in this Profile DB is refused after the dialog, with n
   assert.deepEqual(watched.writes, []);
   assert.equal(store.listProjects().data.length, 1);
 });
+// ------------------------------------------------------------ task-14 (A1): skip + typed answers
+
+const ISO = "2026-11-16T00:00:00.000Z";
+const projectRow = (projectId, name, projectKey) => ({ projectId, name, projectKey, createdAt: ISO, updatedAt: ISO });
+
+test("task-14: a skipped project card is refused with the skip wording and writes nothing", async (t) => {
+  const store = storeFor(t);
+  const watched = watchedStore(store);
+  const root = liveAgent("session-root");
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+  // The Client submits an empty selection when the user dismisses the card; the
+  // provider must not dress that up as a menu error and must not write a binding.
+  const asker = scriptedAsker([{ kind: "answered", reply: { selected: [] } }]);
+
+  const outcome = await resolveSessionProject(root, { agents: registryOf([root]), openStore: () => watched, asker });
+  assert.equal(outcome.ok, false, JSON.stringify(outcome));
+  assert.equal(outcome.reason, "PROJECT_REQUIRED");
+  assert.equal(outcome.message, PROJECT_SKIPPED_MESSAGE, "跳过必须有自己的文案，不能复用「选一个选项」");
+  assert.match(outcome.message, /without a selection/u);
+  assert.match(outcome.message, /nothing was written/u);
+  assert.match(outcome.message, /Call the tool again/u);
+  assert.doesNotMatch(outcome.message, /Select exactly one project option/u);
+  assert.deepEqual(watched.writes, [], "跳过零写入");
+  assert.equal(store.getBoundProject("session-root").data, null);
+});
+
+test("task-14: a typed answer resolves by label, projectKey, or a unique name", () => {
+  const projects = [
+    projectRow(1, "Atlas", "atlas"),
+    projectRow(2, "Atlas", "atlas-two"),
+    projectRow(3, "Borealis", "borealis"),
+  ];
+  const byLabel = resolveProjectChoice({ selected: [], custom: "Atlas · atlas-two" }, projects);
+  assert.equal(byLabel.kind, "existing");
+  assert.equal(byLabel.project.projectId, 2);
+
+  const byKey = resolveProjectChoice({ selected: [], custom: "borealis" }, projects);
+  assert.equal(byKey.kind, "existing");
+  assert.equal(byKey.project.projectId, 3);
+
+  const byUniqueName = resolveProjectChoice({ selected: [], custom: "Borealis" }, projects);
+  assert.equal(byUniqueName.kind, "existing");
+  assert.equal(byUniqueName.project.projectId, 3);
+
+  // Typing the create-new label is the same intent as clicking it.
+  assert.equal(resolveProjectChoice({ selected: [], custom: NEW_PROJECT_LABEL }, projects).kind, "new");
+});
+
+test("task-14: a typed answer that is fuzzy, ambiguous, or unknown is refused, never guessed", () => {
+  const projects = [
+    projectRow(1, "Atlas", "atlas"),
+    projectRow(2, "Atlas", "atlas-two"),
+    projectRow(3, "Borealis", "borealis"),
+  ];
+  // Ambiguous name: two projects share it, so matching by name would land on the wrong one.
+  const ambiguous = resolveProjectChoice({ selected: [], custom: "Atlas" }, projects);
+  assert.equal(ambiguous.kind, "refused");
+  assert.equal(ambiguous.message, PROJECT_TYPED_AMBIGUOUS_MESSAGE);
+
+  for (const typed of ["Atla", "bore", "borealis-two", "Ghost"]) {
+    const refused = resolveProjectChoice({ selected: [], custom: typed }, projects);
+    assert.equal(refused.kind, "refused", typed);
+    assert.equal(refused.message, PROJECT_TYPED_UNKNOWN_MESSAGE, typed);
+  }
+  // Whitespace-only text is a skip, not an unknown answer.
+  assert.equal(resolveProjectChoice({ selected: [], custom: "   " }, projects).message, PROJECT_SKIPPED_MESSAGE);
+  // A malformed multi-selection keeps the pre-existing menu wording.
+  assert.match(resolveProjectChoice({ selected: ["a", "b"] }, projects).message, /Select exactly one project option/u);
+});
+

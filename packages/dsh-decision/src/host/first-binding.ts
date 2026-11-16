@@ -139,33 +139,98 @@ export function buildProjectChoicePrompt(projects: readonly ProjectRecord[]): As
 /**
  * Resolve the user's selection to a project identity (contract line 79).
  *
- * Resolution is by exact option label, which embeds the key. A bare name is
- * REFUSED rather than matched: matching by name (or by prefix, or by position)
- * would let a selection silently land on a different project when two projects
- * share a name — that is the failure the contract forbids.
+ * Two reply shapes are resolved, both by EXACT identity only:
+ *
+ * 1. a clicked option — matched against the full 名称 · key label, which embeds
+ *    the key, so two projects that share a name stay distinguishable;
+ * 2. a typed answer (`selected: []` + `custom`) — matched against the label,
+ *    then the projectKey, then the name. The name form is accepted ONLY when it
+ *    is unique in this Profile: matching by name (or by prefix, or by position)
+ *    would let a selection silently land on a different project when two
+ *    projects share a name — that is the failure the contract forbids.
+ *
+ * A reply with no option and no text is a SKIP (task-14): the card was
+ * dismissed, nothing is owned, and the refusal must say so instead of reusing
+ * the ambiguous-selection wording (the old single message made a skip look like
+ * a menu error, which is what made the failure unreadable in the field).
  */
 export type ProjectChoice =
   | { readonly kind: "existing"; readonly project: ProjectRecord }
   | { readonly kind: "new" }
   | { readonly kind: "refused"; readonly message: string };
 
+/**
+ * Refusal text when the card was answered without a selection.
+ *
+ * Exported so tools/tests can pin the wording: the operator sees this string
+ * through the Agent tool result, and it has to state (a) that a skip happened,
+ * (b) that nothing was written, (c) exactly how to proceed.
+ */
+export const PROJECT_SKIPPED_MESSAGE =
+  "The project question was answered without a selection, so nothing was written. " +
+  "Call the tool again and pick a project by its 名称 · key label, or pick 新建项目 to create one.";
+
+/** Refusal text when a typed answer matches no project in this Profile. */
+export const PROJECT_TYPED_UNKNOWN_MESSAGE =
+  "The typed answer matches no project in this Profile. Pick one of the offered 名称 · key labels, " +
+  "or type a project key exactly as it appears after the separator.";
+
+/** Refusal text when a typed answer names more than one project. */
+export const PROJECT_TYPED_AMBIGUOUS_MESSAGE =
+  "The typed answer matches more than one project name in this Profile; pick the 名称 · key label instead.";
+
 export function resolveProjectChoice(reply: AskReply, projects: readonly ProjectRecord[]): ProjectChoice {
   const labels = reply.selected;
-  if (labels.length !== 1) {
+  if (labels.length > 1) {
+    // multiSelect is false, so more than one label is a malformed reply, not a user choice.
     return { kind: "refused", message: "Select exactly one project option." };
   }
-  const label = labels[0];
-  if (label === NEW_PROJECT_LABEL) return { kind: "new" };
+  if (labels.length === 1) {
+    const label = labels[0];
+    if (label === NEW_PROJECT_LABEL) return { kind: "new" };
 
-  const matches = projects.filter((project) => projectOptionLabel(project) === label);
-  if (matches.length === 1) return { kind: "existing", project: matches[0] };
-  if (matches.length > 1) {
-    return { kind: "refused", message: "The selected option label is ambiguous in this Profile." };
+    const matches = projects.filter((project) => projectOptionLabel(project) === label);
+    if (matches.length === 1) return { kind: "existing", project: matches[0] };
+    if (matches.length > 1) {
+      return { kind: "refused", message: "The selected option label is ambiguous in this Profile." };
+    }
+    return {
+      kind: "refused",
+      message: "Select an offered option; a project is identified by its 名称 · key label, not by name alone.",
+    };
   }
-  return {
-    kind: "refused",
-    message: "Select an offered option; a project is identified by its 名称 · key label, not by name alone.",
-  };
+
+  const typed = (reply.custom ?? "").trim();
+  if (typed === "") {
+    // No option, no text: the user skipped the card. Nothing was written.
+    return { kind: "refused", message: PROJECT_SKIPPED_MESSAGE };
+  }
+  return resolveTypedChoice(typed, projects);
+}
+
+/**
+ * Resolve a typed answer by exact identity: label, then key, then unique name.
+ *
+ * Order matters: the label embeds the key, so a label hit is always the most
+ * specific answer. Every branch rejects rather than guesses — no prefix, no
+ * case folding, no "first match wins".
+ */
+function resolveTypedChoice(typed: string, projects: readonly ProjectRecord[]): ProjectChoice {
+  if (typed === NEW_PROJECT_LABEL) return { kind: "new" };
+
+  const byLabel = projects.filter((project) => projectOptionLabel(project) === typed);
+  if (byLabel.length === 1) return { kind: "existing", project: byLabel[0] };
+  if (byLabel.length > 1) return { kind: "refused", message: PROJECT_TYPED_AMBIGUOUS_MESSAGE };
+
+  const byKey = projects.filter((project) => project.projectKey === typed);
+  if (byKey.length === 1) return { kind: "existing", project: byKey[0] };
+  if (byKey.length > 1) return { kind: "refused", message: PROJECT_TYPED_AMBIGUOUS_MESSAGE };
+
+  const byName = projects.filter((project) => project.name === typed);
+  if (byName.length === 1) return { kind: "existing", project: byName[0] };
+  if (byName.length > 1) return { kind: "refused", message: PROJECT_TYPED_AMBIGUOUS_MESSAGE };
+
+  return { kind: "refused", message: PROJECT_TYPED_UNKNOWN_MESSAGE };
 }
 
 /** Step 1 of contract line 80: collect and validate the project name. */

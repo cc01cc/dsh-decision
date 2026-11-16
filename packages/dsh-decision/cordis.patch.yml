@@ -17,3 +17,7 @@
       name: "@cc01cc/dsh-decision"
       config:
         databasePath: !!js "(() => { const u = ctx.baseUrl; if (!u) return undefined; let s = decodeURIComponent(String(u)); if (s.startsWith('file:///')) s = s.slice(8); else if (s.startsWith('file://')) s = '//' + s.slice(7); if (!s.endsWith('/')) s += '/'; return s + 'decision.sqlite'; })()"
+        # task-14：会话首次「选项目」卡片的最长等待窗（毫秒）。
+        # 缺省即插件内 DEFAULT_PROJECT_QUESTION_TIMEOUT_MS = 120000；此处显式写出便于 profile 覆盖。
+        # 超时走 askTimed 的 pending 分支 = 零写入（契约 §2 line 80），不是异常路径。
+        projectQuestionTimeoutMs: 120000

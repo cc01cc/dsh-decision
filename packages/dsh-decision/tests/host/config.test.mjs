@@ -4,7 +4,15 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { Config, apply, getDecisionStore, openConfiguredStore, resolveDatabasePath } from "../../src/host/config.ts";
+import {
+  Config,
+  DEFAULT_PROJECT_QUESTION_TIMEOUT_MS,
+  apply,
+  getDecisionStore,
+  openConfiguredStore,
+  resolveDatabasePath,
+  resolvePluginSettings,
+} from "../../src/host/config.ts";
 
 const tempRoots = new Set();
 after(() => {
@@ -140,3 +148,23 @@ test("task-147: 缺 databasePath 的报错必须可照做（含形态与示例�
         },
     );
 });
+
+test("task-14: projectQuestionTimeoutMs 默认 120000、显式可配、不可用值 fail-closed", () => {
+  const databasePath = join(tempRoot(), "decisions.sqlite");
+  assert.equal(DEFAULT_PROJECT_QUESTION_TIMEOUT_MS, 120000, "缺省窗口固定为 120 s");
+  assert.equal(resolvePluginSettings({ databasePath }).projectQuestionTimeoutMs, DEFAULT_PROJECT_QUESTION_TIMEOUT_MS);
+  assert.equal(resolvePluginSettings({ databasePath, projectQuestionTimeoutMs: 45_000 }).projectQuestionTimeoutMs, 45_000);
+  assert.equal(resolvePluginSettings({ databasePath }).databasePath, resolveDatabasePath({ databasePath }), "路径口径不变");
+  for (const bad of [0, -1, 1.5, 2_147_483_648]) {
+    assert.throws(
+      () => resolvePluginSettings({ databasePath, projectQuestionTimeoutMs: bad }),
+      (error) => {
+        assert.match(error.message, /projectQuestionTimeoutMs/u);
+        assert.match(error.message, /positive integer/u);
+        return true;
+      },
+      "应当拒绝: " + String(bad),
+    );
+  }
+});
+

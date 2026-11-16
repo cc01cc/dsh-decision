@@ -54,6 +54,19 @@ export function isCompatibleHostToolsVersion(resolvedVersion: string): boolean {
 }
 
 /**
+ * Host-face options the composition root accepts from validated plugin Config.
+ *
+ * task-14: only the first-project-question window travels this way. It reaches
+ * the provider through `DecisionToolDeps.projectTimeoutMs` — one source — and
+ * the question adapter takes the per-call value, so there is no second default
+ * to drift out of sync with `config.ts`.
+ */
+export interface DecisionHostOptions {
+  /** Upper bound for the first project question of a session, in ms. */
+  readonly projectQuestionTimeoutMs?: number;
+}
+
+/**
  * Register the six tools with the Host-provided compiler.
  *
  * Every refusal throws: a missing defineTool or a version mismatch must fail
@@ -63,6 +76,7 @@ export function isCompatibleHostToolsVersion(resolvedVersion: string): boolean {
 export async function registerDecisionToolsWithHost(
   surfaces: DecisionHostSurfaces,
   openStore: () => DecisionToolStore,
+  options: DecisionHostOptions = {},
 ): Promise<void> {
   // Non-literal specifier: keeps the optional Host peer out of static module
   // resolution (see the module doc).
@@ -88,6 +102,9 @@ export async function registerDecisionToolsWithHost(
       agents: adaptAgentRegistry(surfaces.agents),
       openStore,
       asker: createQuestionAsker(surfaces.userQuestions),
+      ...(options.projectQuestionTimeoutMs === undefined
+        ? {}
+        : { projectTimeoutMs: options.projectQuestionTimeoutMs }),
     },
     defineTool as ToolCompiler,
   );

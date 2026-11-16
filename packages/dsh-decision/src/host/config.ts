@@ -24,10 +24,33 @@ import type { DecisionHostSurfaces } from "./register.ts";
  */
 export const Config = z.object({
   databasePath: z.string().min(1).required(),
+  /**
+   * task-14: upper bound for the FIRST project question of a session, in ms.
+   *
+   * Why a bound at all: the Host's blocking `userQuestions.ask()` never resolves
+   * until a Client answers (dsh-user-questions 0.2.2-rc.3 lib/index.js:675-718),
+   * so an unattended call would wait forever. `askTimed` turns "nobody answered"
+   * into `{pending:true}`, which the provider already treats as a zero-write
+   * refusal (contract §2 line 80). Absent = `DEFAULT_PROJECT_QUESTION_TIMEOUT_MS`.
+   */
+  projectQuestionTimeoutMs: z.number(),
 });
+
+/** Default first-question window: long enough to read the card, short enough to fail. */
+export const DEFAULT_PROJECT_QUESTION_TIMEOUT_MS = 120_000;
+
+/** The Host timer ceiling it validates against (dsh-user-questions BAD_TIMEOUT). */
+const MAX_PROJECT_QUESTION_TIMEOUT_MS = 2_147_483_647;
 
 export interface DecisionPluginConfig {
   databasePath: string;
+  projectQuestionTimeoutMs?: number;
+}
+
+/** Validated plugin Config: the database path plus the resolved question window. */
+export interface DecisionPluginSettings {
+  readonly databasePath: string;
+  readonly projectQuestionTimeoutMs: number;
 }
 
 /**
@@ -53,6 +76,16 @@ function configHelp(): string {
     '      databasePath: "<absolute path to a .sqlite file>"',
     "Constraints: absolute path; a file path (not an existing directory); not inside node_modules",
     "or the plugin package; not :memory:. The parent directory must already exist.",
+  ].join("\n");
+}
+
+/** Actionable wording for an unusable `projectQuestionTimeoutMs` (task-14). */
+function timeoutHelp(): string {
+  return [
+    "",
+    "projectQuestionTimeoutMs is OPTIONAL: omit it to use " + String(DEFAULT_PROJECT_QUESTION_TIMEOUT_MS) + " ms.",
+    "When set it must be a positive integer number of milliseconds up to " + String(MAX_PROJECT_QUESTION_TIMEOUT_MS) + ".",
+    'Example: config: { databasePath: "<absolute path>", projectQuestionTimeoutMs: 120000 }',
   ].join("\n");
 }
 
@@ -92,23 +125,65 @@ function assertOutsidePackage(databasePath: string): void {
  * Throws `TypeError` on every rejection; callers must not continue on failure.
  */
 export function resolveDatabasePath(input: unknown): string {
+  return databasePathOf(validateConfig(input));
+}
+
+/** Run the Schemastery schema over untrusted loader input (task-147 wording). */
+function validateConfig(input: unknown): DecisionPluginConfig {
   // The Schemastery schema validates untrusted input at this boundary, so the
   // declared parameter type (object shape) cannot describe a raw `unknown`.
   const validate = Config as unknown as (value: unknown) => DecisionPluginConfig;
-  let config: DecisionPluginConfig;
   try {
-    config = validate(input);
+    return validate(input);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new TypeError(`Invalid decision plugin Config: ${reason}${configHelp()}`);
   }
+}
 
+/** Storage-side path gate: absolute file path, never a directory, never inside the package. */
+function databasePathOf(config: DecisionPluginConfig): string {
   const databasePath = validateDatabasePath(config.databasePath);
   if (existsSync(databasePath) && statSync(databasePath).isDirectory()) {
     throw new TypeError("databasePath must be a SQLite file path, not an existing directory.");
   }
   assertOutsidePackage(databasePath);
   return databasePath;
+}
+
+/**
+ * Resolve the first-project-question window (task-14).
+ *
+ * Absent keeps the shipped default; anything that is not a positive integer the
+ * Host timer accepts is refused rather than clamped — a silently clamped window
+ * would hide a typo in the profile config.
+ */
+function projectQuestionTimeoutOf(config: DecisionPluginConfig): number {
+  const raw = config.projectQuestionTimeoutMs;
+  if (raw === undefined) return DEFAULT_PROJECT_QUESTION_TIMEOUT_MS;
+  const usable = typeof raw === "number"
+    && Number.isSafeInteger(raw)
+    && raw >= 1
+    && raw <= MAX_PROJECT_QUESTION_TIMEOUT_MS;
+  if (!usable) {
+    throw new TypeError(`Invalid decision plugin Config: $.projectQuestionTimeoutMs is not a usable millisecond count.${timeoutHelp()}`);
+  }
+  return raw;
+}
+
+/**
+ * Validate plugin Config once and return everything the Host face needs.
+ *
+ * The loader entry (`apply`) uses this instead of `resolveDatabasePath` so the
+ * database gate and the question window are read from the SAME validated object;
+ * `resolveDatabasePath` stays exported for callers that only need the path.
+ */
+export function resolvePluginSettings(input: unknown): DecisionPluginSettings {
+  const config = validateConfig(input);
+  return {
+    databasePath: databasePathOf(config),
+    projectQuestionTimeoutMs: projectQuestionTimeoutOf(config),
+  };
 }
 
 /** Open the Profile store described by plugin Config; throws on any refusal. */
@@ -152,9 +227,9 @@ export const inject = ["tools", "agents", "userQuestions"];
  * Host-provided defineTool (task-404); registration errors reject the load.
  */
 export function apply(ctx: Context, config: unknown): void | Promise<void> {
-  const databasePath = resolveDatabasePath(config);
+  const settings = resolvePluginSettings(config);
   ctx.effect(() => {
-    const store = SQLiteDecisionStore.open({ databasePath });
+    const store = SQLiteDecisionStore.open({ databasePath: settings.databasePath });
     storesByContext.set(ctx, store);
     return () => {
       storesByContext.delete(ctx);
@@ -169,6 +244,8 @@ export function apply(ctx: Context, config: unknown): void | Promise<void> {
     return;
   }
   return import("./register.ts").then(({ registerDecisionToolsWithHost }) =>
-    registerDecisionToolsWithHost(surfaces as DecisionHostSurfaces, () => getDecisionStore(ctx)),
+    registerDecisionToolsWithHost(surfaces as DecisionHostSurfaces, () => getDecisionStore(ctx), {
+      projectQuestionTimeoutMs: settings.projectQuestionTimeoutMs,
+    }),
   );
 }

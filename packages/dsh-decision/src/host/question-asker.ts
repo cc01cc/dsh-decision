@@ -150,8 +150,16 @@ export function createQuestionAsker(
     }
   };
 
-  const askTimed = async (agent: unknown, prompt: AskPrompt, callId: string): Promise<AskOutcome> => {
-    const timeoutMs = options.timeoutMs;
+  const askTimed = async (
+    agent: unknown,
+    prompt: AskPrompt,
+    callId: string,
+    callTimeoutMs?: number,
+  ): Promise<AskOutcome> => {
+    // task-14: the per-call window wins over the adapter default. The provider
+    // passes the configured value on every call (first-binding -> askTimed), so a
+    // caller that names its own window is never silently widened.
+    const timeoutMs = callTimeoutMs ?? options.timeoutMs;
     if (timeoutMs === undefined) return ask(agent, prompt);
     try {
       const request: UserQuestionsRequest = {

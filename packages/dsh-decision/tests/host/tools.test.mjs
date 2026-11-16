@@ -763,3 +763,33 @@ test("task-1: search schema declares the new inputs, the shared ref-type enum, a
   assert.equal(DECISION_TOOL_NAMES.length, 6, "the frozen surface stays six tools");
 });
 
+
+// ------------------------------------------------ task-14 (A2): first-question window
+
+test("task-14: the configured first-question window reaches the Host askTimed call and a timeout writes nothing", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+  const timed = [];
+  const asker = {
+    async ask() { throw new Error("the blocking ask() must not be used when a window is configured"); },
+    async askTimed(_agent, prompt, callId, timeoutMs) {
+      timed.push({ promptId: prompt.id, callId, timeoutMs });
+      return { kind: "pending", callId: String(callId) };
+    },
+  };
+  const deps = { agents: registryOf([root]), openStore: () => store, asker, projectTimeoutMs: 45_000 };
+  const search = createDecisionTools(deps).find((entry) => entry.name === "decision_search");
+  const outcome = await invoke(search, root, { limit: 1 });
+
+  assert.equal(outcome.threw, false, JSON.stringify(outcome));
+  assert.equal(outcome.value.ok, false);
+  assert.equal(outcome.value.error.code, "PROJECT_REQUIRED");
+  assert.match(outcome.value.error.message, /did not answer in time/u);
+  assert.equal(timed.length, 1, "只问一次");
+  assert.equal(timed[0].timeoutMs, 45_000, "配置值原样交给宿主计时器");
+  assert.equal(timed[0].callId, "dsd-project-choice", "前台等待按稳定 callId 记账");
+  assert.equal(store.getBoundProject("session-root").data, null, "超时零写入");
+  assert.equal(store.listProjects().data.length, 1, "超时不建项目");
+});
+
