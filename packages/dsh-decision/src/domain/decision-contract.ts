@@ -372,8 +372,13 @@ export function parseDecisionCreateInput(input: unknown): DomainResult<DecisionC
   if (!rationale.ok) return rationale;
   const sourceReference = parseNullableText(object.data, "sourceReference", 4_000);
   if (!sourceReference.ok) return sourceReference;
+  // task-46（唯一真相 = long_term）：此处曾是 temporary（冻结契约 spec 表 line 99 的旧值），
+  // 而 store 层对「原始输入省略 timeHorizon」一律落 long_term，工具描述也写 long_term ——
+  // 同一字段出现两个相反缺省，调用方省略时「按描述读长期、按解析器读临时」。
+  // 现按工具面已落地行为（生产库 1286 条实测全部 long_term）与语义（temporary = 缓做，
+  // 误标比保守更糟）统一为 long_term；契约 spec 表那一行待用户裁定后同批改文。
   const timeHorizon = object.data.timeHorizon === undefined
-    ? success<TimeHorizon>("temporary")
+    ? success<TimeHorizon>("long_term")
     : parseTimeHorizon(object.data.timeHorizon, "timeHorizon");
   if (!timeHorizon.ok) return timeHorizon;
   const decisionDate = parseDatePatchField(object.data, "decisionDate");

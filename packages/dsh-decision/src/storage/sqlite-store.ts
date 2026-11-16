@@ -369,9 +369,12 @@ interface CreateExtensionSplit {
   externalId?: string;
   refs?: DecisionRef[];
   replaces?: number[];
-  /** True when the raw input omitted timeHorizon: the store default (long_term,
-   * requirements §10.5) applies instead of the frozen parser's historical
-   * temporary default. */
+  /** True when the raw input omitted timeHorizon: the store default (long_term)
+   * applies. Kept as a defensive split even after task-46 aligned the parser's
+   * default to long_term — the raw input can still omit the field, and this flag
+   * is what lets the store ignore a parser-filled value. (The earlier comment here
+   * cited requirements §10.5 as the source of long_term; §10.5 only defers the
+   * field name/values to PLAN-0769 and specifies no default — corrected 2026-11-16.) */
   timeHorizonOmitted: boolean;
 }
 

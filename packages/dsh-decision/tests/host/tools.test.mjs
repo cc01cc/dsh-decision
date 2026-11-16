@@ -793,3 +793,39 @@ test("task-14: the configured first-question window reaches the Host askTimed ca
   assert.equal(store.listProjects().data.length, 1, "超时不建项目");
 });
 
+test("task-46: 省略 timeHorizon 在工具面落 long_term（单条与批量），显式值仍然胜出", async (t) => {
+  const store = storeFor(t);
+  const root = liveAgent("session-root");
+  const deps = { agents: registryOf([root]), openStore: () => store, asker: chooserFor("Atlas · atlas") };
+  store.createProject({ name: "Atlas", projectKey: "atlas" });
+  const tools = createDecisionTools(deps);
+  const create = tools.find((tool) => tool.name === "decision_create");
+  const batch = tools.find((tool) => tool.name === "decision_create_batch");
+
+  // 描述写 long_term、解析器曾默认 temporary、store 另有一套缺省 —— 三处只有一处能是真相。
+  // 这里钉住调用方看得见的那一层：工具面省略该字段后，库里必须是 long_term。
+  const single = await invoke(create, root, { decision: "省略 horizon（单条）" });
+  assert.equal(single.value.ok, true, JSON.stringify(single.value));
+  const singleRow = store.getDecision(1, { decisionId: single.value.data.decisionId });
+  assert.equal(singleRow.data.timeHorizon, "long_term", "单条省略必须落 long_term，不得落 temporary");
+  assert.deepEqual(single.value.data, {
+    decisionId: single.value.data.decisionId,
+    revision: 1,
+    summary: null,
+    status: "effective",
+    createdAt: single.value.data.createdAt,
+  }, "回执不暴露 timeHorizon，判据只能看库");
+
+  const many = await invoke(batch, root, {
+    decisions: [{ decision: "省略 horizon（批量）" }, { decision: "显式 temporary", timeHorizon: "temporary" }],
+  });
+  assert.equal(many.value.ok, true, JSON.stringify(many.value));
+  const horizons = many.value.data.decisions.map(
+    (decision) => store.getDecision(1, { decisionId: decision.decisionId }).data.timeHorizon,
+  );
+  assert.deepEqual(horizons, ["long_term", "temporary"], "批内逐条独立缺省，显式值不被覆盖");
+
+  const explicit = await invoke(create, root, { decision: "显式 temporary（单条）", timeHorizon: "temporary" });
+  assert.equal(store.getDecision(1, { decisionId: explicit.value.data.decisionId }).data.timeHorizon, "temporary");
+});
+

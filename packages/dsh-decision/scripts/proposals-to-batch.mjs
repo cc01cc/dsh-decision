@@ -137,7 +137,9 @@ function checkReplaces(value, errors, warnings) {
   if (!Array.isArray(value)) { errors.push("replaces 必须是数字数组"); return { present: true, list: undefined }; }
   if (value.length === 0) {
     // 缺省 = 「不声明取代」；空数组语义相同但通常说明作者没填完 ⇒ 不报错，必须留警告。
-    warnings.push("replaces 是空数组：与缺省等价（输出里省略该字段）；若本意是取代某条，请填 DSD 数字 id");
+    // 实测：工具对 replaces: [] 直接 VALIDATION_FAILED（Expected 1–100 decision numbers.），
+    // 所以这里不是「等价于缺省」，而是「必须省略」——省略即「不声明取代」。
+    warnings.push("replaces 是空数组：工具会拒（Expected 1–100 decision numbers.），已按缺省省略；若本意是取代某条，请填 DSD 数字 id");
     return { present: true, list: undefined };
   }
   const list = [];

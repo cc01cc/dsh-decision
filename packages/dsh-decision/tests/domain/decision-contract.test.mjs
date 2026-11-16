@@ -78,10 +78,11 @@ test("create input rejects missing, mistyped, and unknown fields", () => {
   errorOf(parseDecisionCreateInput([validCreate]), "input");
 });
 
-test("create defaults timeHorizon and preserves nullable-field semantics", () => {
+test("create defaults timeHorizon to long_term and preserves nullable-field semantics", () => {
+  // task-46：缺省唯一真相 = long_term（与工具描述、store 行为、生产库 1286 条一致）。
   assert.deepEqual(valueOf(parseDecisionCreateInput(validCreate)), {
     decision: "Use SQLite.",
-    timeHorizon: "temporary",
+    timeHorizon: "long_term",
   });
   const parsed = valueOf(parseDecisionCreateInput({
     decision: "Use SQLite.",
