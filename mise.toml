@@ -1,0 +1,21 @@
+# A12-DSH-decision task runner (task-44 / ZC T-2330).
+# Lint gate: oxlint 1.83.0 (workspace-root devDependency), config = ./.oxlintrc.json.
+# -c is EXPLICIT on every invocation: without it oxlint walks up past this repo and
+# picks up one/.oxlintrc.json (typeAware) -> "Failed to find tsgolint executable".
+
+[tasks.lint]
+depends = ["lint:scripts", "lint:src"]
+description = "Run all linters (oxlint; correctness + no-undef, 0 error / 0 warning)"
+alias = "lint"
+
+[tasks."lint:scripts"]
+# JS surface: repo-root scripts/*.mjs (7) + package scripts/*.mjs (2) + tests/**/*.mjs (17).
+run = "node node_modules/oxlint/bin/oxlint -c .oxlintrc.json --deny-warnings scripts packages/dsh-decision/scripts packages/dsh-decision/tests"
+description = "Lint scripts + package scripts + tests (oxlint; --deny-warnings)"
+alias = "lint:scripts"
+
+[tasks."lint:src"]
+# TS surface: packages/dsh-decision/src/**/*.ts (11). Root src/ is an empty leftover shell, not tracked.
+run = "node node_modules/oxlint/bin/oxlint -c .oxlintrc.json --deny-warnings packages/dsh-decision/src"
+description = "Lint packages/dsh-decision/src (oxlint; --deny-warnings)"
+alias = "lint:src"

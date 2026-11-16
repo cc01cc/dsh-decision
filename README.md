@@ -39,6 +39,16 @@ DSH is the primary form of this plugin. A thin CLI is a **second adapter on the 
 
 Scope, the minimal call surface, what this project deliberately does **not** do, and how CLI and the DSH plugin divide work are frozen in [`docs/adapter-boundary.md`](docs/adapter-boundary.md). Read it before proposing any caller-identity, token, or permission-model work.
 
+## Development commands
+
+Run from the repository root (pnpm 10.33.0, Node.js 24+):
+
+- `pnpm run lint` — oxlint over `scripts/`, `packages/dsh-decision/scripts/`, `packages/dsh-decision/tests/`, and `packages/dsh-decision/src/` (config: `.oxlintrc.json`; correctness + `no-undef` as errors, `--deny-warnings`: any warning also fails). Equivalent mise entry: `mise run lint` (aggregates `lint:scripts` + `lint:src`).
+- `pnpm run typecheck` — TypeScript project references (host + client).
+- `pnpm test` — node:test suites plus the packaging-surface gate.
+
+Pre-commit checks: run `pnpm run lint` and `pnpm test` before committing, and validate the commit message with `node scripts/check-commit-msg.mjs --file .git/COMMIT_EDITMSG` (see [`docs/commit-message-convention.md`](docs/commit-message-convention.md)). This repository has no CI workflow yet; these local gates are the referenced check surface.
+
 ## Development status
 
 Repository initialized from the upstream LICENSE-only commit. Plugin UI and tool extension points are available in the installed Host; the SQLite backend packaging path and deletion/revision policy remain to be confirmed before implementation. No plugin has been installed into a DSH profile.

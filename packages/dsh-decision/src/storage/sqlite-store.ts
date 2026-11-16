@@ -12,15 +12,11 @@ import {
 } from "../domain/decision-contract.ts";
 import type {
   DecisionCreateInput,
-  DecisionGetInput,
   DecisionRecord,
-  DecisionSearchInput,
   DecisionStatus,
   DecisionUpdateInput,
-  DecisionVoidInput,
   DomainErrorCode,
   DomainResult,
-  ProjectInput,
   TimeHorizon,
 } from "../domain/decision-contract.ts";
 
@@ -270,6 +266,7 @@ function validateSessionId(value: unknown): DomainResult<string> {
 const CREATE_EXTENSION_FIELDS = new Set(["externalId", "refs", "replaces"]);
 
 /** The contract's White_Space set, identical to UNICODE_WHITE_SPACE_SQL above. */
+// oxlint-disable-next-line no-control-regex -- intentional: the decision contract's White_Space set includes control characters by design.
 const CONTRACT_WHITE_SPACE = /[\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/u;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -712,7 +709,7 @@ function parseSearchInput(input: unknown): DomainResult<DecisionSearchParsedInpu
   return { ok: true, data: { query: undefined, timeHorizon, refType, refId, replacedDecisionId, withoutRefType, withRefTypes, queryMode: "literal" as const, keywords: [], includeVoided, limit, offset } };
 }
 
-function timestamp(): string {
+function _timestamp(): string {
   return new Date().toISOString();
 }
 
@@ -758,7 +755,7 @@ function toSafeId(value: number | bigint): number {
   return numeric;
 }
 
-function toProjectRecord(row: ProjectRow): ProjectRecord {
+function _toProjectRecord(row: ProjectRow): ProjectRecord {
   return {
     projectId: row.projectId,
     name: row.name,

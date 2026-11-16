@@ -474,7 +474,7 @@ test("void snapshots once, repeated matching void is idempotent, and voided upda
   assert.equal(dataOf(store.getDecisionHistory(project.projectId, created.decisionId)).length, 1);
 });
 
-test("schema preflight rejects incompatible DELETE-mode files without changing persistent state", (t) => {
+test("schema preflight rejects incompatible DELETE-mode files without changing persistent state", (_t) => {
   const assertPreservedAfterRefusal = (databasePath, messagePattern, expectedVersion, expectedTables, valueQuery) => {
     assert.throws(() => SQLiteDecisionStore.open({ databasePath }), messagePattern);
     const check = new DatabaseSync(databasePath);
@@ -743,7 +743,7 @@ test("v2 database migrates to v3 and backfills decision_replaces from the author
   assert.deepEqual(hits.decisions.map((d) => d.decisionId), [newer.decisionId]);
 });
 
-test("a v2 file with an unexpected shape is refused before any ALTER", (t) => {
+test("a v2 file with an unexpected shape is refused before any ALTER", (_t) => {
   const paths = tempPath();
   const seedStore = SQLiteDecisionStore.open({ databasePath: paths.databasePath });
   seedStore.createProject({ name: "Atlas", projectKey: "atlas" });
@@ -775,7 +775,7 @@ test("a v2 file with an unexpected shape is refused before any ALTER", (t) => {
   }
 });
 
-test("a failed v1 migration rolls back completely and leaves the file at v1", (t) => {
+test("a failed v1 migration rolls back completely and leaves the file at v1", (_t) => {
   const paths = tempPath();
   const seed = seedV1Database(paths.databasePath);
   // An object that already owns one of the migration's index names makes the

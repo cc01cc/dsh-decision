@@ -96,7 +96,7 @@ function expandIds(text) {
 }
 
 const RE_ADJUNCT = /^\*\*\s*`?(D-\d+)\s*(附记|补记|附注|补注|勘误)\s*（/;
-const RE_BOLD_MULTI = /^\*\*\s*`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)（(.*?)\*\*(.*)$/;
+const RE_BOLD_MULTI = /^\*\*\s*`?(D-\d+(?:\s*[+／/、,，～~]\s*`?D?-?\d+)*)（(.*?)\*\*(.*)$/;
 
 function independentInventory() {
   const files = [join(ONE, "internal/A03-xihe/docs/lead-decisions-ledger.md"), join(ONE, "internal/A03-xihe/docs/archive/lead-decisions-2026-11-05-to-2026-11-08.md")];
@@ -105,7 +105,7 @@ function independentInventory() {
     let cur = null;
     const flush = () => { if (cur) { for (const d of cur.dnums) if (!byD.has(d)) byD.set(d, cur.kind); cur = null; } };
     for (const line of readFileSync(file, "utf8").split("\n")) {
-      const h = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)/);
+      const h = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[+／/、,，～~]\s*`?D?-?\d+)*)/);
       if (h) {
         const uniq = [...new Set(expandIds(h[1]))];
         if (cur && cur.dnums.length === 1 && cur.dnums[0] === uniq[0]) continue; // 同号吸收

@@ -63,7 +63,7 @@ function scriptedAsker(replies) {
   return {
     calls,
     async ask(agent, prompt) { return next(agent, prompt); },
-    async askTimed(agent, prompt, callId, _timeoutMs) { return next(agent, prompt); },
+    async askTimed(agent, prompt, _callId, _timeoutMs) { return next(agent, prompt); },
   };
 }
 
@@ -91,7 +91,7 @@ const PENDING = { kind: "pending", callId: "call-1" };
 test("line 79: the choice prompt lists every project as 名称 · key plus a create-new option", (t) => {
   const store = storeFor(t);
   const root = liveAgent("session-root");
-  const registry = registryOf([root]);
+  const _registry = registryOf([root]);
   // Two projects with DIFFERENT names, and two that share a name but not a key.
   store.createProject({ name: "Atlas", projectKey: "atlas" });
   store.createProject({ name: "Atlas", projectKey: "atlas-two" });

@@ -44,23 +44,23 @@ const PROJECT_KEY = "xh-ledger";
 const PROJECT_NAME = "XH 代裁台账（迁移查询面）";
 
 const RE = {
-  row: /^\|\s*\`?D-(\d+)\`?\s*\|/,
+  row: /^\|\s*`?D-(\d+)`?\s*\|/,
   // 条目标题含 ##/###/#### 三级（台账格式演进：近期裁定多用 ##）。
-  heading: /^(#{2,4})\s+\`?D-(\d+)\`?(.*)$/,
+  heading: /^(#{2,4})\s+`?D-(\d+)`?(.*)$/,
   // 严格 T1-e 口径（与盘点器逐字一致）只认 ###/####，单独计数对账。
-  t1eHeading: /^#{3,4}\s+\`?D-\d+/,
+  t1eHeading: /^#{3,4}\s+`?D-\d+/,
   // 项目符号式条目（§3 早期形态）：- **D-753｜标题**：正文…
   bullet: /^-\s+\*\*D-(\d+)[｜|]?(.*?)\*\*[：:]?\s*(.*)$/,
   // 粗体行首式条目（§3 近期大量形态，task-480）：**D-1248（标题…）**：正文…
   // 边界必须精确到「数字后紧跟全角（」——正文里的句首强调 **D-1117 的落点裁定
   // 不变**（… 不是条目（实测 D-1118 被它吞空）；同号补记/附记 **D-992 补记（…）**
   // 数字后是空格，不匹配本边界，按下方同号吸收规则并入母条目。
-  bold: /^\*\*\s*`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)（(.*?)\*\*(.*)$/,
+  bold: /^\*\*\s*`?(D-\d+(?:\s*[+／/、,，～~]\s*`?D?-?\d+)*)（(.*?)\*\*(.*)$/,
   // 同号附记（**D-1274 附记（…）**：数字后是标签词）：不是新条目边界，
   // 而是母条目的补录。标签是封闭集，别放成任意文本（task-480 的宽正则教训）。
   boldAdjunct: /^\*\*\s*`?(D-\d+)\s*(附记|补记|附注|补注|勘误)\s*（(.*?)\*\*(.*)$/,
-  nextEntry: /^#{2,4}\s+\`?D-\d+/,
-  section: /^##\s+(?!.*\`?D-\d)/,
+  nextEntry: /^#{2,4}\s+`?D-\d+/,
+  section: /^##\s+(?!.*`?D-\d)/,
   date: /(\d{4}-\d{2}-\d{2})/,
   plan: /\bPLAN-\d{4}\b/g,
   task: /\btask-\d+\b/g,
@@ -68,8 +68,8 @@ const RE = {
   dref: /\bD-\d+\b/g,
   bl: /\bBL-\d{3,4}\b/g,
   // 显式取代：主动语态（本条取代 D-xxx / 标题级取代 D-xxx），被动语态单独识别。
-  replacesActive: /(?:本条|本裁定)?取代\*{0,2}\s*[：:]?\s*\*{0,2}\`?D-(\d+)\`?/g,
-  replacesPassive: /被\s*\*{0,2}\`?D-(\d+)\`?\*{0,2}[^|。]{0,20}取代|已被\s*\*{0,2}\`?D-(\d+)\`?\*{0,2}\s*(?:取代|supersede)/gi,
+  replacesActive: /(?:本条|本裁定)?取代\*{0,2}\s*[：:]?\s*\*{0,2}`?D-(\d+)`?/g,
+  replacesPassive: /被\s*\*{0,2}`?D-(\d+)`?\*{0,2}[^|。]{0,20}取代|已被\s*\*{0,2}`?D-(\d+)`?\*{0,2}\s*(?:取代|supersede)/gi,
   partial: /部分|①|②|③|前提|配套理由|事实判断/,
 };
 
@@ -236,7 +236,7 @@ function collectEntries(strict = false) {
       const h = line.match(headingRe);
       if (h) {
         const level = h[1].length;
-        const dnum = Number(h[2]);
+        const _dnum = Number(h[2]);
         if (level === 2) level2Headings += 1;
         // task-27 / D-1743 (P1)：同号吸收按**字符串 externalId** 比较，不按数字。
         // 卷 A 的 `| D-01 |` 与主册的 `**D-1（` 是两条正文互不相同的裁定；
@@ -251,7 +251,7 @@ function collectEntries(strict = false) {
         flush();
         // 多号展开只认标题起首的并列枚举（D-802 / D-803 / …）；
         // 标题里被修订/引用/撤销的 D 号不是并列条目（防跨条正文污染）。
-        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[+／\/、,，～~]\s*`?D?-?\d+)*)/);
+        const enumMatch = line.match(/^#{2,4}\s+`?(D-\d+(?:\s*[+／/、,，～~]\s*`?D?-?\d+)*)/);
         const rawIds = enumMatch ? expandIdList(enumMatch[1]) : ["D-" + h[2]];
         const uniqueRaw = [...new Set(rawIds)];
         const uniqueDnums = uniqueRaw.map((s) => Number(s.slice(2)));
@@ -467,7 +467,7 @@ function scanReplaces(built, byDnum, statusNotes) {
     const text = (b.input.summary ?? "") + "\n" + b.input.decision;
     for (const m of text.matchAll(RE.replacesActive)) {
       const context = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 40);
-      const passive = /已被|被\s*\`?D-/.test(text.slice(Math.max(0, m.index - 6), m.index));
+      const passive = /已被|被\s*`?D-/.test(text.slice(Math.max(0, m.index - 6), m.index));
       if (passive) { leftInText.push({ from: b.externalId, to: "D-" + Number(m[1]), source: "entry", reason: "被动语态（本条被取代，非本条取代）" }); continue; }
       consider(Number(b.externalId.slice(2)), Number(m[1]), context, "entry");
     }

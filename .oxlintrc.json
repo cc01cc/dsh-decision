@@ -1,0 +1,16 @@
+{
+  "env": {
+    "node": true
+  },
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "no-undef": "error"
+  },
+  "ignorePatterns": [
+    "**/node_modules",
+    "**/lib",
+    "**/.tsbuild"
+  ]
+}

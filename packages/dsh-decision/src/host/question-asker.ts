@@ -73,7 +73,7 @@ function toQuestions(prompt: AskPrompt): UserQuestionsQuestion[] {
   }];
 }
 
-function promptOf(request: UserQuestionsRequest): AskPrompt {
+function _promptOf(request: UserQuestionsRequest): AskPrompt {
   const first = request.questions[0];
   return {
     id: first?.id ?? PROMPT_ID,

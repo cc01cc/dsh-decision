@@ -20,7 +20,7 @@ function storeFor(t) {
 // Pressure test: the exact failure scenario from task-281, 300 rounds.
 // Reproduces dsd-1's probe: three inserts inside one millisecond, then one update,
 // then the contract's updatedAt DESC / id DESC ordering assertion (line 114).
-test("300-round pressure: no timestamp collisions and no wrong order", (t) => {
+test("300-round pressure: no timestamp collisions and no wrong order", (_t) => {
   const runs = 300;
   let collisions = 0;
   let wrongOrder = 0;
@@ -53,7 +53,7 @@ test("300-round pressure: no timestamp collisions and no wrong order", (t) => {
 // Ticks are allocated at write time, so every already-stored row keeps its exact
 // updatedAt value. (The task-377 v1->v2 migration is covered separately in
 // sqlite-store.test.mjs; it also preserves stored rows.)
-test("existing rows keep their stored updatedAt across reopen (no re-migration)", (t) => {
+test("existing rows keep their stored updatedAt across reopen (no re-migration)", (_t) => {
   const root = mkdtempSync(join(tmpdir(), "reopen-"));
   const databasePath = join(root, "d.sqlite");
   const store = SQLiteDecisionStore.open({ databasePath });

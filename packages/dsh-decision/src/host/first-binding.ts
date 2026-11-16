@@ -288,7 +288,7 @@ function refusal(message: string): SessionProjectOutcome {
   return { ok: false, reason: "PROJECT_REQUIRED", message };
 }
 
-function fromDomainError<T>(result: { readonly ok: false; readonly error: DomainErrorBody }): SessionProjectOutcome {
+function fromDomainError<_T>(result: { readonly ok: false; readonly error: DomainErrorBody }): SessionProjectOutcome {
   return { ok: false, error: result.error };
 }
 
