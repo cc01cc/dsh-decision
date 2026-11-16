@@ -151,7 +151,18 @@ test("粗体条目行是边界且三处账对得上（task-480 / D-1383）", { s
   const inventory = independentInventory();
   const kindCounts = [...inventory.values()].reduce((acc, k) => { acc[k] = (acc[k] ?? 0) + 1; return acc; }, {});
   assert.ok(kindCounts.bold > 0, "台账存在粗体式条目（边界生效）");
-  assert.equal(inventory.size, report.caliber.uniqueEntries, "独立盘点去重数 == 迁移 uniqueEntries");
+  // task-27 / D-1743 (P1)：迁移侧去重键 = 字符串 externalId（D-01 与 D-1 各自成条），
+  // 独立盘点仍是「数字口径」粗去重 ⇒ 报告侧先投影到同一口径再比，并把零填充别名显式列出：
+  // 字符串口径 = 数字口径 + 零填充别名（当前仅 D-01）。这样该断言仍钉「三处账」而不是钉某个整数。
+  const reportIds = new Set(report.caliber.externalIds);
+  const reportNumeric = new Set([...reportIds].map((id) => "D-" + String(Number(id.slice(2)))));
+  assert.equal(inventory.size, reportNumeric.size, "独立盘点（数字口径）== 迁移条目按数字投影");
+  const paddedAliases = [...reportIds].filter((id) => /^D-0\d/u.test(id) && reportIds.has("D-" + String(Number(id.slice(2)))));
+  assert.equal(
+    report.caliber.uniqueEntries,
+    reportNumeric.size + paddedAliases.length,
+    "字符串口径 = 数字口径 + 零填充别名（" + paddedAliases.join(",") + "）",
+  );
   assert.equal(report.caliber.entryKinds?.bold ?? 0, kindCounts.bold ?? 0, "粗体条目数与独立盘点一致");
   // 关键回归：D-1247 不再吞并后续粗体条目、各自独立且不超上限。
   const oversized = report.caliber.parseFailed.filter((f) => f.reasons.some((r) => /超 20000/.test(r)));

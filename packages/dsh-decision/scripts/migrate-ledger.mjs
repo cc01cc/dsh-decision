@@ -15,6 +15,9 @@
 //     --strict = 盘点器 T1-e 原口径（###/#### + 表格行）严格子集复算（D-1251）
 //   node scripts/migrate-ledger.mjs --database <abs-path> --recent 20 [--report <path>]
 //   node scripts/migrate-ledger.mjs --database <abs-path> [--report <path>]
+// task-27（D-1741：DSD 升为 D 号主存储）新增，缺省值不变：
+//   --project-key <key> [--project-name <name>]  迁移目标项目（默认 xh-ledger）
+//   --export <path>                              条目级 JSON 快照（--dry-run 亦可，只读台账）
 //
 // 退出码：0 成功 ｜ 2 输入读不出/空扫描 ｜ 1 迁移中出现存储拒绝（逐条报告）。
 //
@@ -28,6 +31,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { SQLiteDecisionStore, validateDatabasePath } from "../src/storage/sqlite-store.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -90,7 +94,14 @@ function die(message, code = 2) {
 }
 
 function parseArgs(argv) {
-  const args = { dryRun: false, recent: null, report: null, database: null, strict: false };
+  const args = {
+    dryRun: false, recent: null, report: null, database: null, strict: false,
+    // task-27 (D-1741)：DSD 升为 D 号主存储后，迁移目标项目由调用方指定。
+    // 缺省仍是历史值 xh-ledger（脚本单测与既有报告不受影响）。
+    projectKey: null, projectName: null,
+    // task-27：导出条目级 JSON 快照（台账改指向/归档前的省力件）。与写入互不依赖。
+    exportPath: null,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--dry-run") args.dryRun = true;
@@ -98,11 +109,64 @@ function parseArgs(argv) {
     else if (a === "--recent") args.recent = Number(argv[++i]);
     else if (a === "--report") args.report = argv[++i];
     else if (a === "--database") args.database = argv[++i];
+    else if (a === "--project-key") args.projectKey = argv[++i];
+    else if (a === "--project-name") args.projectName = argv[++i];
+    else if (a === "--export") args.exportPath = argv[++i];
     else die("未知参数: " + a, 1);
   }
   if (!args.dryRun && !args.database) die("--database 必填（或用 --dry-run 只盘点）", 1);
   if (args.recent !== null && (!Number.isInteger(args.recent) || args.recent < 1)) die("--recent 需正整数", 1);
+  if (args.projectKey !== null && !/^[a-z0-9-]{1,48}$/u.test(args.projectKey)) die("--project-key 需小写 kebab-case（1-48）", 1);
   return args;
+}
+
+/**
+ * 条目级 JSON 快照（task-27 / D-1741）。
+ *
+ * 用途：台账降级为待归档历史件时，其他 lane 的「运行时读取台账」需要改指向；
+ * 这份快照就是最省力的改指向源（D 号 → 标题/正文/日期/出处/refs/replaces）。
+ * 只读台账，不碰数据库；--dry-run 也能导出。
+ */
+function writeExport(exportPath, built, failed, args) {
+  const sources = SOURCES.map((s) => {
+    const abs = resolve(ONE_ROOT, s.rel);
+    const bytes = readFileSync(abs);
+    return { path: s.rel, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+  });
+  const entries = built.map((b) => ({
+    externalId: b.externalId,
+    ok: b.ok,
+    source: { file: b.entry.file, line: b.entry.line, kind: b.entry.kind },
+    ...(b.ok
+      ? {
+        summary: b.input.summary ?? null,
+        decision: b.input.decision,
+        rationale: b.input.rationale ?? null,
+        decisionDate: b.input.decisionDate ?? null,
+        sourceReference: b.input.sourceReference,
+        refs: b.input.refs,
+      }
+      : { reasons: b.reasons }),
+  }));
+  const payload = {
+    // 快照 schema 版本：guard-1（task-28）等下游按此判形态，破坏性变更必须递增。
+    schemaVersion: 1,
+    task: "task-27",
+    mode: "export" + (args.strict ? "-strict" : ""),
+    generatedAt: new Date().toISOString(),
+    sources,
+    counts: {
+      candidates: entries.length,
+      ok: entries.filter((e) => e.ok).length,
+      failed: entries.filter((e) => !e.ok).length,
+      failedIds: failed.map((f) => f.externalId),
+    },
+    entries,
+  };
+  const json = JSON.stringify(payload);
+  mkdirSync(dirname(resolve(exportPath)), { recursive: true });
+  writeFileSync(resolve(exportPath), json + "\n", "utf8");
+  console.log("export → " + resolve(exportPath) + " (" + Buffer.byteLength(json, "utf8") + " B, " + entries.length + " entries)");
 }
 
 /** 表格行按未转义管道切格（两源文件实测无 \\| 转义）。 */
@@ -174,7 +238,10 @@ function collectEntries(strict = false) {
         const level = h[1].length;
         const dnum = Number(h[2]);
         if (level === 2) level2Headings += 1;
-        if (current && current.dnums.length === 1 && current.dnum === dnum) {
+        // task-27 / D-1743 (P1)：同号吸收按**字符串 externalId** 比较，不按数字。
+        // 卷 A 的 `| D-01 |` 与主册的 `**D-1（` 是两条正文互不相同的裁定；
+        // 按数字比会把前者的 8 格正文并进后者 —— 实测跨条污染（dsd-1 task-27）。
+        if (current && (current.extIds ?? [current.extId]).length === 1 && current.extId === "D-" + h[2]) {
           // 单号母条目的补录/补条/更正：append-only，属于母条目正文。
           // 多号批次不在此吸收成员详情标题（否则详情扩散到全体成员）。
           current.bodyLines.push(line);
@@ -217,7 +284,7 @@ function collectEntries(strict = false) {
       const ba = strict ? null : line.match(RE.boldAdjunct);
       if (ba) {
         const dnum = Number(ba[1].slice(2));
-        if (current && (current.dnums ?? [current.dnum]).includes(dnum)) {
+        if (current && (current.extIds ?? [current.extId]).includes(ba[1])) {
           current.bodyLines.push(line);
           current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
           return;
@@ -238,9 +305,10 @@ function collectEntries(strict = false) {
       }
       const bo = strict ? null : line.match(RE.bold);
       if (bo) {
-        const ids = expandIdList(bo[1]).map((s) => Number(s.slice(2)));
+        const rawIds = expandIdList(bo[1]);
+        const ids = rawIds.map((s) => Number(s.slice(2)));
         const single = ids.length === 1;
-        if (current && single && (current.dnums ?? [current.dnum]).length === 1 && current.dnum === ids[0]) {
+        if (current && single && (current.extIds ?? [current.extId]).length === 1 && current.extId === rawIds[0]) {
           // 同号补记/附记/补条（**D-992 补记…**）：append-only 归母条目正文。
           current.bodyLines.push(line);
           current.adjunctMerged = (current.adjunctMerged ?? []).concat([{ file: src.label, line: lineNo }]);
@@ -250,7 +318,7 @@ function collectEntries(strict = false) {
         if (single) boldEntries += 1; else multiNumberHeadings += 1;
         const inner = bo[2].replace(/\s*[）)]$/, "").trim();
         const rest = bo[3].replace(/^[：:]\s*/, "").trim();
-        const extIds = ids.map((d) => "D-" + d);
+        const extIds = rawIds; // task-27 (P1)：保留台账原样零填充（D-01 ≠ D-1）
         current = {
           dnum: ids[0], dnums: ids, extId: extIds[0], extIds,
           kind: "bold", file: src.label, line: lineNo,
@@ -309,22 +377,26 @@ function collectEntries(strict = false) {
   for (const entry of ordered) {
     if (entry.kind === "index") {
       const cells = entry.cells;
-      indexMeta.set(entry.dnum, { date: (cells[1] ?? "").match(RE.date)?.[1] ?? null, status: cells[3] ?? null, file: entry.file, line: entry.line });
+      indexMeta.set((entry.extIds ?? [entry.extId])[0], { date: (cells[1] ?? "").match(RE.date)?.[1] ?? null, status: cells[3] ?? null, file: entry.file, line: entry.line });
       continue;
     }
     const dnums = entry.dnums ?? [entry.dnum];
+    const extIds = entry.extIds ?? [entry.extId];
     for (let k = 0; k < dnums.length; k += 1) {
       const dnum = dnums[k];
-      const prev = byD.get(dnum);
-      if (!prev) { byD.set(dnum, { ...entry, dnum, extId: (entry.extIds ?? [entry.extId])[k] }); continue; }
+      const extId = extIds[k];
+      // task-27 / D-1743 (P1)：去重键 = 字符串 externalId（D-01 与 D-1 各自成条）；
+      // dnum 只留作排序与取代关系解析。
+      const prev = byD.get(extId);
+      if (!prev) { byD.set(extId, { ...entry, dnum, extId }); continue; }
       mergeInto(prev, entry);
     }
   }
-  const entries = [...byD.values()].sort((a, b) => a.dnum - b.dnum);
+  const entries = [...byD.values()].sort((a, b) => a.dnum - b.dnum || a.extId.localeCompare(b.extId));
   return {
     raw, lineLevelT1e, level2Headings, bulletEntries, boldEntries, adjunctEntries, multiNumberHeadings, statusNotes, entries, indexMeta,
     mergedSupplements: entries.filter((e) => e.merged || e.adjunctMerged).map((e) => ({
-      d: "D-" + e.dnum, kept: { file: e.file, line: e.line },
+      d: e.extId, kept: { file: e.file, line: e.line },
       merged: (e.adjunctMerged ?? []).concat(e.merged ?? []),
     })),
   };
@@ -333,8 +405,8 @@ function collectEntries(strict = false) {
 /** 一条候选 → DSD create 输入；解析失败返回 reasons（人工队列）。 */
 function buildDecision(entry, indexMeta) {
   const reasons = [];
-  const externalId = entry.extId; // 台账原样（D-01 保零填充），去重/排序按数字。
-  const meta = indexMeta.get(entry.dnum);
+  const externalId = entry.extId; // 台账原样（D-01 保零填充）；去重键即此字符串（P1），排序按数字。
+  const meta = indexMeta.get(entry.extId);
   let decision = null;
   let summary = null;
   let rationale = null;
@@ -436,7 +508,14 @@ function main() {
   const built = entries.map((e) => ({ entry: e, ...buildDecision(e, indexMeta) }));
   const failed = built.filter((b) => !b.ok);
   const ok = built.filter((b) => b.ok);
-  const byDnum = new Map(ok.map((b) => [Number(b.externalId.slice(2)), b]));
+  // task-27 / D-1743 (P1)：同一数字可能有多条（D-1 与 D-01）。取代关系按数字解析，
+  // 故每个数字取「无零填充」的那条作规范代表（台账里的取代写法一律是 D-1238 式）。
+  const byDnum = new Map();
+  for (const b of ok) {
+    const n = Number(b.externalId.slice(2));
+    const prev = byDnum.get(n);
+    if (prev === undefined || (prev.externalId !== "D-" + n && b.externalId === "D-" + n)) byDnum.set(n, b);
+  }
   const replaces = scanReplaces(ok, byDnum, statusNotes);
   const replacesByFrom = new Map();
   for (const e of replaces.edges) {
@@ -478,14 +557,18 @@ function main() {
   };
   for (const b of ok) for (const r of b.input.refs) report.refs.byType[r.type] += 1;
 
+  if (args.exportPath !== null) writeExport(args.exportPath, built, failed, args);
+
   if (!args.dryRun) {
     const databasePath = validateDatabasePath(args.database);
     const store = SQLiteDecisionStore.open({ databasePath });
     try {
-      let project = store.getProjectByKey(PROJECT_KEY);
+      const projectKey = args.projectKey ?? PROJECT_KEY;
+      const projectName = args.projectName ?? PROJECT_NAME;
+      let project = store.getProjectByKey(projectKey);
       if (!project.ok) throw new Error("getProjectByKey: " + JSON.stringify(project.error));
       if (project.data === null) {
-        const made = store.createProject({ name: PROJECT_NAME, projectKey: PROJECT_KEY });
+        const made = store.createProject({ name: projectName, projectKey });
         if (!made.ok) throw new Error("createProject: " + JSON.stringify(made.error));
         project = made;
       }
@@ -523,7 +606,7 @@ function main() {
         }
       }
       flush();
-      report.migration = { projectId, created, alreadyExisted, batches, refused };
+      report.migration = { projectId, projectKey, projectName: project.data.name, created, alreadyExisted, batches, refused };
 
       // 查询面抽查（真 store API，非桩）。
       const first = selected[0];
